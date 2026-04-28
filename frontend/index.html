@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LoL Match Predictor</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' x2='1' y1='0' y2='1'%3E%3Cstop offset='0' stop-color='%235b8cff'/%3E%3Cstop offset='1' stop-color='%23ff5d6c'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='28' fill='url(%23g)'/%3E%3Ctext x='50%25' y='56%25' text-anchor='middle' fill='white' font-family='Arial' font-weight='800' font-size='28'%3EW%3C/text%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --bg: #0b1018;
+      --bg2: #0e1622;
+      --card: #131c2b;
+      --card-hi: #1a2538;
+      --border: #232f44;
+      --border-hi: #324360;
+      --text: #e6edf3;
+      --muted: #8b9bb1;
+      --muted-strong: #b6c3d6;
+      --accent: #5b8cff;
+      --accent-hi: #7aa3ff;
+      --blue: #4f8cff;
+      --blue-deep: #2a4f99;
+      --red: #ff5d6c;
+      --red-deep: #99323d;
+      --good: #3fb950;
+      --bad: #f85149;
+      --shadow: 0 1px 0 rgba(255,255,255,0.04), 0 8px 24px rgba(0,0,0,0.35);
+    }
+    * { box-sizing: border-box; }
+    html, body { background: var(--bg); }
+    body {
+      margin: 0;
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1100px 600px at 90% -10%, rgba(91,140,255,0.10), transparent 60%),
+        radial-gradient(900px 500px at -10% 110%, rgba(255,93,108,0.08), transparent 60%),
+        var(--bg);
+    }
+    header {
+      padding: 26px 0 14px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+    }
+    header .wrap { max-width: 1100px; margin: 0 auto; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    header h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+    header .sub { color: var(--muted); font-size: 13px; }
+    header .pills { display: flex; gap: 8px; flex-wrap: wrap; }
+    main { max-width: 1100px; margin: 24px auto 60px; padding: 0 20px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--card); border: 1px solid var(--border);
+      color: var(--muted-strong); font-size: 12px;
+      padding: 4px 10px; border-radius: 999px;
+    }
+    .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+      margin-bottom: 18px;
+    }
+    .card h2 { margin: 0 0 16px; font-size: 16px; font-weight: 600; }
+    .card h3 { margin: 18px 0 10px; font-size: 13px; font-weight: 600; color: var(--muted-strong); text-transform: uppercase; letter-spacing: 0.05em; }
+
+    label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.04em; }
+    input, select, button {
+      width: 100%;
+      background: var(--bg2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 11px;
+      font: inherit;
+      transition: border-color 120ms, background 120ms;
+    }
+    input:focus, select:focus { outline: none; border-color: var(--accent); }
+    button {
+      background: linear-gradient(180deg, var(--accent), #4775e8);
+      color: #fff; border: none; cursor: pointer; font-weight: 600;
+      padding: 11px 16px; border-radius: 10px;
+      transition: transform 80ms, filter 120ms;
+    }
+    button:hover:not(:disabled) { filter: brightness(1.08); }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.secondary { background: var(--card-hi); color: var(--text); border: 1px solid var(--border); }
+
+    .matchup {
+      display: grid; grid-template-columns: 1fr auto 1fr; align-items: stretch; gap: 14px;
+    }
+    .team-pane { display: flex; flex-direction: column; gap: 10px; }
+    .team-pane.blue  { border-top: 3px solid var(--blue); padding-top: 12px; }
+    .team-pane.red   { border-top: 3px solid var(--red);  padding-top: 12px; }
+    .vs {
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; color: var(--muted); font-size: 14px; padding: 0 6px;
+    }
+    .vs button { padding: 6px 8px; font-size: 11px; }
+    .controls-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+
+    .role-list { display: flex; flex-direction: column; gap: 8px; }
+    .role {
+      display: grid; grid-template-columns: 64px 1fr 1.3fr;
+      gap: 8px; align-items: center;
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px 10px;
+    }
+    .role .role-tag {
+      font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .role input { background: transparent; border: none; padding: 4px 0; }
+    .role input:focus { border: none; outline: none; }
+    .role .champ-wrap { display: flex; align-items: center; gap: 8px; }
+    .role .champ-icon {
+      width: 28px; height: 28px; border-radius: 6px; background: #243047;
+      flex-shrink: 0; background-size: cover; background-position: center;
+      border: 1px solid var(--border);
+    }
+
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 6px; }
+    .stat {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 10px;
+    }
+    .stat .k { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat .v { font-weight: 700; font-size: 14px; }
+    .stat .v.good { color: var(--good); }
+    .stat .v.bad  { color: var(--bad); }
+
+    .result-bar {
+      height: 36px; border-radius: 10px; overflow: hidden;
+      display: flex; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05);
+      background: var(--bg2);
+      transition: all 400ms;
+    }
+    .result-bar > div {
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 14px; color: #fff;
+      transition: width 400ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .result-bar .blue { background: linear-gradient(90deg, var(--blue-deep), var(--blue)); }
+    .result-bar .red  { background: linear-gradient(90deg, var(--red), var(--red-deep)); }
+
+    .result-row {
+      display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; margin-bottom: 10px;
+    }
+    .result-row .name { font-size: 16px; font-weight: 700; }
+    .result-row .name.right { text-align: right; }
+    .result-row .vs-tag { color: var(--muted); font-size: 12px; }
+
+    .recent-matches { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+    .match-row {
+      display: grid; grid-template-columns: 100px 1fr auto; gap: 10px; align-items: center;
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+      font-size: 13px;
+    }
+    .match-row .when { color: var(--muted); font-size: 11px; }
+    .match-row .who  { display: flex; gap: 8px; align-items: center; min-width: 0; }
+    .match-row .who .t { font-weight: 600; }
+    .match-row .who .t.lost { color: var(--muted); text-decoration: line-through; }
+    .match-row .who .t.won  { color: var(--good); }
+    .match-row .league { font-size: 11px; color: var(--muted); }
+
+    .muted { color: var(--muted); }
+    pre { background: var(--bg2); border: 1px solid var(--border); padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; }
+    summary { cursor: pointer; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    @media (max-width: 760px) {
+      .matchup { grid-template-columns: 1fr; }
+      .vs { padding: 6px 0; }
+      .grid-2 { grid-template-columns: 1fr; }
+    }
+
+    .toast {
+      position: fixed; right: 22px; bottom: 22px;
+      background: var(--card); border: 1px solid var(--border); padding: 10px 14px; border-radius: 10px;
+      box-shadow: var(--shadow); color: var(--text); font-size: 13px;
+      transform: translateY(140%); transition: transform 220ms;
+    }
+    .toast.show { transform: translateY(0); }
+
+    .skeleton {
+      background: linear-gradient(90deg, var(--card-hi) 0%, var(--bg2) 50%, var(--card-hi) 100%);
+      background-size: 200% 100%; animation: shimmer 1.4s infinite;
+      border-radius: 6px; height: 14px;
+    }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div>
+        <h1>LoL Match Predictor</h1>
+        <div class="sub">Pro-only competitive history · last 3 patches</div>
+      </div>
+      <div class="pills" id="meta-pills"></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <h2>Predict a match</h2>
+      <div class="matchup">
+        <!-- Team 1 (Blue) -->
+        <div class="team-pane blue">
+          <div>
+            <label>Team 1 (Blue side default)</label>
+            <input id="team1" list="teamsList" placeholder="e.g. T1" autocomplete="off" />
+          </div>
+          <div class="stats" id="t1-stats"></div>
+          <div class="role-list" id="t1roles"></div>
+        </div>
+
+        <div class="vs">
+          <div style="display:flex; flex-direction:column; gap:6px; align-items:center;">
+            <div>VS</div>
+            <button class="secondary" id="swapBtn" title="Swap sides">⇄</button>
+          </div>
+        </div>
+
+        <!-- Team 2 (Red) -->
+        <div class="team-pane red">
+          <div>
+            <label>Team 2 (Red side default)</label>
+            <input id="team2" list="teamsList" placeholder="e.g. Gen.G" autocomplete="off" />
+          </div>
+          <div class="stats" id="t2-stats"></div>
+          <div class="role-list" id="t2roles"></div>
+        </div>
+      </div>
+
+      <datalist id="teamsList"></datalist>
+      <datalist id="champList"></datalist>
+
+      <div class="controls-row">
+        <div>
+          <label>Team 1 Side</label>
+          <select id="side">
+            <option value="Blue">Blue</option>
+            <option value="Red">Red</option>
+          </select>
+        </div>
+        <div>
+          <label>Patch (optional)</label>
+          <input id="patch" placeholder="auto-detect" />
+        </div>
+      </div>
+
+      <div style="margin-top:16px">
+        <button id="predictBtn">Predict winner</button>
+      </div>
+    </div>
+
+    <div class="card" id="resultCard" style="display:none">
+      <h2>Prediction</h2>
+      <div class="result-row">
+        <div class="name" id="rt1"></div>
+        <div class="vs-tag" id="modelTag">model</div>
+        <div class="name right" id="rt2"></div>
+      </div>
+      <div class="result-bar">
+        <div class="blue" id="bar1"></div>
+        <div class="red"  id="bar2"></div>
+      </div>
+
+      <div class="grid-2" style="margin-top:18px">
+        <div>
+          <h3>Head-to-head</h3>
+          <div id="h2hSummary" class="muted">—</div>
+          <div class="recent-matches" id="h2hRecent"></div>
+        </div>
+        <div>
+          <h3>Recent form</h3>
+          <div id="recentForm"></div>
+        </div>
+      </div>
+
+      <details style="margin-top:14px">
+        <summary class="muted">Feature dump</summary>
+        <pre id="featDump"></pre>
+      </details>
+    </div>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+const API = (location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.hostname === "")
+  ? "http://localhost:8000"
+  : "";
+
+const ROLES = ["Top", "Jungle", "Mid", "Bot", "Support"];
+let CHAMP_INDEX = {}; // name -> { icon_url, id }
+
+function toast(msg, ms = 2200) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove("show"), ms);
+}
+
+function fmtPct(x) { return (x * 100).toFixed(1) + "%"; }
+
+function renderRoleInputs(host) {
+  host.innerHTML = ROLES.map(r => `
+    <div class="role" data-role-row="${r}">
+      <div class="role-tag">${r}</div>
+      <input data-role="${r}" data-kind="player" placeholder="Player" autocomplete="off" />
+      <div class="champ-wrap">
+        <div class="champ-icon" data-icon-for="${r}"></div>
+        <input data-role="${r}" data-kind="champ" placeholder="Champion" list="champList" autocomplete="off" />
+      </div>
+    </div>
+  `).join("");
+  // Update icon when champion field changes
+  host.querySelectorAll('input[data-kind="champ"]').forEach(el => {
+    el.addEventListener("input", () => {
+      const role = el.dataset.role;
+      const icon = host.querySelector(`[data-icon-for="${role}"]`);
+      const c = CHAMP_INDEX[el.value.trim()];
+      icon.style.backgroundImage = c ? `url(${c.icon_url})` : "";
+    });
+  });
+}
+renderRoleInputs(document.getElementById("t1roles"));
+renderRoleInputs(document.getElementById("t2roles"));
+
+function readLineup(host) {
+  const out = [];
+  ROLES.forEach(r => {
+    const player = host.querySelector(`[data-role="${r}"][data-kind="player"]`).value.trim();
+    const champ  = host.querySelector(`[data-role="${r}"][data-kind="champ"]`).value.trim();
+    if (player && champ) out.push({ player, champion: champ, role: r });
+  });
+  return out;
+}
+
+async function autoFillLineup(host, team) {
+  if (!team) return;
+  try {
+    const r = await fetch(API + "/team/" + encodeURIComponent(team) + "/lineup");
+    if (!r.ok) return;
+    const j = await r.json();
+    j.lineup.forEach(p => {
+      const el = host.querySelector(`[data-role="${p.role}"][data-kind="player"]`);
+      if (el && !el.value.trim()) el.value = p.player;
+    });
+  } catch (_) {}
+}
+
+function renderTeamStats(hostId, stats) {
+  if (!stats) {
+    document.getElementById(hostId).innerHTML = "";
+    return;
+  }
+  const wr = (stats.winrate * 100).toFixed(1);
+  const blue = (stats.blue.winrate * 100).toFixed(1);
+  const red  = (stats.red.winrate * 100).toFixed(1);
+  document.getElementById(hostId).innerHTML = `
+    <div class="stat"><div class="k">Games</div><div class="v">${stats.games}</div></div>
+    <div class="stat"><div class="k">Winrate</div><div class="v ${stats.winrate>=0.5?'good':'bad'}">${wr}%</div></div>
+    <div class="stat"><div class="k">Side WR (B/R)</div><div class="v">${blue}% / ${red}%</div></div>
+  `;
+}
+
+async function loadTeamStats(team, hostId) {
+  if (!team) { renderTeamStats(hostId, null); return; }
+  try {
+    const r = await fetch(API + "/team/" + encodeURIComponent(team) + "/stats");
+    if (!r.ok) { renderTeamStats(hostId, null); return; }
+    renderTeamStats(hostId, await r.json());
+  } catch (_) {}
+}
+
+["team1", "team2"].forEach((id, idx) => {
+  const el = document.getElementById(id);
+  el.addEventListener("change", e => {
+    const team = e.target.value.trim();
+    const host = document.getElementById(idx === 0 ? "t1roles" : "t2roles");
+    autoFillLineup(host, team);
+    loadTeamStats(team, idx === 0 ? "t1-stats" : "t2-stats");
+  });
+});
+
+document.getElementById("swapBtn").addEventListener("click", () => {
+  const t1 = document.getElementById("team1");
+  const t2 = document.getElementById("team2");
+  [t1.value, t2.value] = [t2.value, t1.value];
+  // Swap lineups
+  const r1 = document.getElementById("t1roles");
+  const r2 = document.getElementById("t2roles");
+  ROLES.forEach(role => {
+    ["player","champ"].forEach(kind => {
+      const a = r1.querySelector(`[data-role="${role}"][data-kind="${kind}"]`);
+      const b = r2.querySelector(`[data-role="${role}"][data-kind="${kind}"]`);
+      [a.value, b.value] = [b.value, a.value];
+      a.dispatchEvent(new Event("input"));
+      b.dispatchEvent(new Event("input"));
+    });
+  });
+  // Swap stats
+  loadTeamStats(t1.value.trim(), "t1-stats");
+  loadTeamStats(t2.value.trim(), "t2-stats");
+});
+
+function fmtMatchRow(m, currentTeam) {
+  const dt = m.datetime_utc ? m.datetime_utc.split(" ")[0] : "";
+  const t1won = m.winner === 1;
+  const t2won = m.winner === 2;
+  return `
+    <div class="match-row">
+      <div class="when">${dt}<br/><span class="league">${m.league_code || ""} · ${m.patch || ""}</span></div>
+      <div class="who">
+        <span class="t ${t1won?'won':(t2won?'lost':'')}">${m.team1}</span>
+        <span class="muted">vs</span>
+        <span class="t ${t2won?'won':(t1won?'lost':'')}">${m.team2}</span>
+      </div>
+      <div class="muted">${m.team1_side || ""} / ${m.team2_side || ""}</div>
+    </div>
+  `;
+}
+
+async function init() {
+  const pills = document.getElementById("meta-pills");
+  try {
+    const [h, patches, teams, champs] = await Promise.all([
+      fetch(API + "/health").then(r => r.json()),
+      fetch(API + "/patches").then(r => r.json()),
+      fetch(API + "/teams").then(r => r.json()),
+      fetch(API + "/champions").then(r => r.json()).catch(() => ({champions:[], version:""})),
+    ]);
+    const modelPill = h.model && h.model.trained
+      ? `<span class="pill" title="Validation accuracy on held-out matches">model · ${(h.model.accuracy*100).toFixed(1)}% acc</span>`
+      : `<span class="pill">model · untrained</span>`;
+    pills.innerHTML = `
+      <span class="pill"><span class="dot"></span>${h.matches_in_db.toLocaleString()} matches</span>
+      <span class="pill">${teams.length} teams</span>
+      <span class="pill">Patches ${patches.map(p => p.patch + (p.is_current ? " ★" : "")).join(", ") || "—"}</span>
+      ${modelPill}
+    `;
+    document.getElementById("teamsList").innerHTML = teams.map(t => `<option value="${t}">`).join("");
+    if (champs.champions) {
+      CHAMP_INDEX = {};
+      champs.champions.forEach(c => { CHAMP_INDEX[c.name] = c; });
+      document.getElementById("champList").innerHTML =
+        champs.champions.map(c => `<option value="${c.name}">`).join("");
+    }
+  } catch (e) {
+    pills.innerHTML = `<span class="pill" style="color:var(--bad)">Backend not reachable — start with: <code>uvicorn backend.api.server:app</code></span>`;
+  }
+}
+init();
+
+document.getElementById("predictBtn").addEventListener("click", async () => {
+  const t1 = document.getElementById("team1").value.trim();
+  const t2 = document.getElementById("team2").value.trim();
+  if (!t1 || !t2) { toast("Pick both teams"); return; }
+  if (t1 === t2)  { toast("Teams must be different"); return; }
+
+  const body = {
+    team1: t1, team2: t2,
+    team1_side: document.getElementById("side").value,
+    patch: document.getElementById("patch").value.trim() || null,
+    team1_players: readLineup(document.getElementById("t1roles")),
+    team2_players: readLineup(document.getElementById("t2roles")),
+  };
+
+  const btn = document.getElementById("predictBtn");
+  btn.disabled = true; btn.textContent = "Predicting…";
+
+  try {
+    const [predRes, h2hRes, t1stats, t2stats] = await Promise.all([
+      fetch(API + "/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      fetch(API + `/h2h?team1=${encodeURIComponent(t1)}&team2=${encodeURIComponent(t2)}`),
+      fetch(API + `/team/${encodeURIComponent(t1)}/stats`),
+      fetch(API + `/team/${encodeURIComponent(t2)}/stats`),
+    ]);
+    if (!predRes.ok) {
+      toast("Error: " + (await predRes.text()).slice(0, 120));
+      return;
+    }
+    const j = await predRes.json();
+    const h = await h2hRes.json();
+    const s1 = await t1stats.json();
+    const s2 = await t2stats.json();
+
+    const p1 = j.team1_win_probability * 100;
+    const p2 = j.team2_win_probability * 100;
+    document.getElementById("resultCard").style.display = "block";
+    document.getElementById("rt1").textContent = `${j.team1} · ${p1.toFixed(1)}%`;
+    document.getElementById("rt2").textContent = `${p2.toFixed(1)}% · ${j.team2}`;
+    document.getElementById("bar1").style.width = p1 + "%";
+    document.getElementById("bar2").style.width = p2 + "%";
+    document.getElementById("bar1").textContent = p1 >= 14 ? p1.toFixed(0) + "%" : "";
+    document.getElementById("bar2").textContent = p2 >= 14 ? p2.toFixed(0) + "%" : "";
+    document.getElementById("modelTag").textContent = j.model;
+    document.getElementById("featDump").textContent = JSON.stringify(j.features, null, 2);
+
+    document.getElementById("h2hSummary").innerHTML = h.games > 0
+      ? `<strong>${h.team1_wins}-${h.team2_wins}</strong> in last ${h.games} games`
+      : '<span class="muted">No prior meetings on these patches</span>';
+    document.getElementById("h2hRecent").innerHTML = (h.recent || []).map(m => fmtMatchRow(m)).join("");
+
+    const fmtTeamForm = (s) => s ? `
+      <div style="margin-bottom:12px">
+        <strong>${s.team}</strong>
+        <span class="muted"> · ${s.wins}-${s.games - s.wins} (${(s.winrate*100).toFixed(1)}%)</span>
+      </div>
+      <div class="recent-matches">${(s.recent_matches || []).slice(0,4).map(m => fmtMatchRow(m)).join("")}</div>
+    ` : "";
+    document.getElementById("recentForm").innerHTML = fmtTeamForm(s1) + fmtTeamForm(s2);
+
+    document.getElementById("resultCard").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) {
+    toast("Network error: " + e);
+  } finally {
+    btn.disabled = false; btn.textContent = "Predict winner";
+  }
+});
+</script>
+</body>
+</html>
