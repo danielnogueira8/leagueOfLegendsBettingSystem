@@ -564,65 +564,76 @@ def recent_matches(team: Optional[str] = None, limit: int = 20):
 
 def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: dict) -> dict:
     """Map the live-feature dict (from features/build) onto the training-feature
-    names that the trained model expects. Live features overlap heavily with
-    training features but use slightly different names; we translate here so
-    the model pipeline can be reused without re-running feature engineering.
+    names the trained model expects. The live and training pipelines share the
+    same shrinkage prior so the values are directly comparable.
     """
     side_wr_t1 = feats.get("team1_blue_wr") if team1_side == "Blue" else feats.get("team1_red_wr")
     side_wr_t2 = feats.get("team2_red_wr")  if team1_side == "Blue" else feats.get("team2_blue_wr")
-    t1_pchamp = feats.get("team1_player_champ_wr", 0.5)
-    t2_pchamp = feats.get("team2_player_champ_wr", 0.5)
-    t1_cg     = feats.get("team1_champ_global_wr", 0.5)
-    t2_cg     = feats.get("team2_champ_global_wr", 0.5)
-    t1_cl     = feats.get("team1_champ_league_wr", 0.5)
-    t2_cl     = feats.get("team2_champ_league_wr", 0.5)
+    t1_wr  = feats.get("team1_winrate", 0.5)
+    t2_wr  = feats.get("team2_winrate", 0.5)
+    t1_cg  = feats.get("team1_champ_global_wr", 0.5)
+    t2_cg  = feats.get("team2_champ_global_wr", 0.5)
+    t1_cl  = feats.get("team1_champ_league_wr", 0.5)
+    t2_cl  = feats.get("team2_champ_league_wr", 0.5)
+    t1_pc  = feats.get("team1_player_champ_wr", 0.5)
+    t2_pc  = feats.get("team2_player_champ_wr", 0.5)
     return {
-        "team1_games":     feats.get("team1_games", 0.0),
-        "team1_winrate":   feats.get("team1_winrate", 0.0),
-        "team1_avg_len":   feats.get("team1_avg_len", 0.0),
-        "team2_games":     feats.get("team2_games", 0.0),
-        "team2_winrate":   feats.get("team2_winrate", 0.0),
-        "team2_avg_len":   feats.get("team2_avg_len", 0.0),
-        "team1_side_wr":   side_wr_t1 or 0.0,
-        "team2_side_wr":   side_wr_t2 or 0.0,
-        "team1_side_blue": 1.0 if team1_side == "Blue" else 0.0,
-        "h2h_games":       feats.get("h2h_games", 0.0),
-        "h2h_team1_wr":    feats.get("h2h_team1_wr", 0.5),
-        "team1_p_games":   0.0,
-        "team1_p_winrate": feats.get("team1_player_wr_avg", 0.0),
-        "team1_p_kda":     feats.get("team1_player_kda_avg", 0.0),
-        "team2_p_games":   0.0,
-        "team2_p_winrate": feats.get("team2_player_wr_avg", 0.0),
-        "team2_p_kda":     feats.get("team2_player_kda_avg", 0.0),
+        "team1_games":           feats.get("team1_games", 0.0),
+        "team2_games":           feats.get("team2_games", 0.0),
+        "team1_winrate":         t1_wr,
+        "team2_winrate":         t2_wr,
+        "wr_diff":               t1_wr - t2_wr,
+        "team1_recent_wr":       feats.get("team1_recent_wr", 0.5),
+        "team2_recent_wr":       feats.get("team2_recent_wr", 0.5),
+        "recent_wr_diff":        feats.get("team1_recent_wr", 0.5) - feats.get("team2_recent_wr", 0.5),
+        "team1_kda":             feats.get("team1_kda", feats.get("team1_player_kda_avg", 0.0)),
+        "team2_kda":             feats.get("team2_kda", feats.get("team2_player_kda_avg", 0.0)),
+        "kda_diff":              feats.get("team1_kda", 0.0) - feats.get("team2_kda", 0.0),
+        "team1_gpm":             feats.get("team1_gpm", 0.0),
+        "team2_gpm":             feats.get("team2_gpm", 0.0),
+        "gpm_diff":              feats.get("team1_gpm", 0.0) - feats.get("team2_gpm", 0.0),
+        "team1_cspm":            feats.get("team1_cspm", 0.0),
+        "team2_cspm":            feats.get("team2_cspm", 0.0),
+        "cspm_diff":             feats.get("team1_cspm", 0.0) - feats.get("team2_cspm", 0.0),
+        "team1_avg_len":         feats.get("team1_avg_len", 0.0),
+        "team2_avg_len":         feats.get("team2_avg_len", 0.0),
+        "team1_side_wr":         side_wr_t1 if side_wr_t1 is not None else 0.5,
+        "team2_side_wr":         side_wr_t2 if side_wr_t2 is not None else 0.5,
+        "team1_side_blue":       1.0 if team1_side == "Blue" else 0.0,
+        "h2h_games":             feats.get("h2h_games", 0.0),
+        "h2h_team1_wr":          feats.get("h2h_team1_wr", 0.5),
         "team1_champ_global_wr": t1_cg,
         "team2_champ_global_wr": t2_cg,
+        "champ_global_diff":     t1_cg - t2_cg,
         "team1_champ_league_wr": t1_cl,
         "team2_champ_league_wr": t2_cl,
-        "team1_pchamp_wr":       t1_pchamp,
-        "team2_pchamp_wr":       t2_pchamp,
+        "champ_league_diff":     t1_cl - t2_cl,
+        "team1_pchamp_wr":       t1_pc,
+        "team2_pchamp_wr":       t2_pc,
+        "pchamp_diff":           t1_pc - t2_pc,
+        "team1_pchamp_n":        feats.get("team1_pchamp_n_total", 0.0),
+        "team2_pchamp_n":        feats.get("team2_pchamp_n_total", 0.0),
         "champ_matchup_wr":      feats.get("champ_matchup_wr", 0.5),
-        "wr_diff":         feats.get("wr_diff", 0.0),
-        "p_wr_diff":       feats.get("pwr_diff", 0.0),
-        "side_wr_diff":    (side_wr_t1 or 0.0) - (side_wr_t2 or 0.0),
-        "champ_global_diff": t1_cg - t2_cg,
-        "champ_league_diff": t1_cl - t2_cl,
-        "pchamp_diff":       t1_pchamp - t2_pchamp,
     }
 
 
 # Feature → group mapping for the prediction explanation. Anything in
 # `FEATURE_COLS` not listed here falls into "other" (currently empty).
 _FEATURE_GROUPS: dict[str, list[str]] = {
-    "team_form":         ["team1_winrate", "team2_winrate", "team1_games", "team2_games",
-                          "team1_avg_len", "team2_avg_len", "wr_diff"],
-    "player_form":       ["team1_p_winrate", "team2_p_winrate", "team1_p_games", "team2_p_games",
-                          "team1_p_kda", "team2_p_kda", "p_wr_diff"],
-    "champion_picks":    ["team1_champ_global_wr", "team2_champ_global_wr", "champ_global_diff",
-                          "team1_champ_league_wr", "team2_champ_league_wr", "champ_league_diff"],
-    "player_on_champion":["team1_pchamp_wr", "team2_pchamp_wr", "pchamp_diff"],
-    "champion_matchup":  ["champ_matchup_wr"],
-    "head_to_head":      ["h2h_team1_wr", "h2h_games"],
-    "side":              ["team1_side_wr", "team2_side_wr", "team1_side_blue", "side_wr_diff"],
+    "team_form":          ["team1_winrate", "team2_winrate", "wr_diff",
+                           "team1_recent_wr", "team2_recent_wr", "recent_wr_diff",
+                           "team1_games", "team2_games",
+                           "team1_avg_len", "team2_avg_len"],
+    "team_performance":   ["team1_kda", "team2_kda", "kda_diff",
+                           "team1_gpm", "team2_gpm", "gpm_diff",
+                           "team1_cspm", "team2_cspm", "cspm_diff"],
+    "champion_picks":     ["team1_champ_global_wr", "team2_champ_global_wr", "champ_global_diff",
+                           "team1_champ_league_wr", "team2_champ_league_wr", "champ_league_diff"],
+    "player_on_champion": ["team1_pchamp_wr", "team2_pchamp_wr", "pchamp_diff",
+                           "team1_pchamp_n", "team2_pchamp_n"],
+    "champion_matchup":   ["champ_matchup_wr"],
+    "head_to_head":       ["h2h_team1_wr", "h2h_games"],
+    "side":               ["team1_side_wr", "team2_side_wr", "team1_side_blue"],
 }
 
 

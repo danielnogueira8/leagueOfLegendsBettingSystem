@@ -41,6 +41,55 @@ class MatchInput:
     league: Optional[str] = None            # None => auto-detect from team1's most-played league
 
 
+# Bayesian shrinkage prior used at inference time. Must match the value in
+# backend.models.dataset (SHRINK_K = 10) for live features to fall in the same
+# distribution as the training features.
+SHRINK_K = 10.0
+
+
+def _shrink(wins: float, games: float, prior: float = 0.5, k: float = SHRINK_K) -> float:
+    return (wins + k * prior) / (games + k)
+
+
+def _team_recent_form(conn: sqlite3.Connection, team: str, last_n: int = 5) -> float:
+    """Shrunken WR over the team's last N matches in the patch window.
+    Mirrors the training-time signal so live and training distributions match.
+    """
+    rows = conn.execute(
+        """
+        SELECT team1, team2, winner FROM matches
+        WHERE (team1 = :t OR team2 = :t)
+        ORDER BY datetime_utc DESC
+        LIMIT :n
+        """,
+        {"t": team, "n": last_n},
+    ).fetchall()
+    g = len(rows)
+    w = sum(1 for r in rows
+            if (r["team1"] == team and r["winner"] == 1)
+            or (r["team2"] == team and r["winner"] == 2))
+    return _shrink(w, g, 0.5, k=2.0)
+
+
+def _team_perf(conn: sqlite3.Connection, team: str) -> Dict[str, float]:
+    """Per-minute KPIs (kda/gpm/cspm) for a team across the window. Mirrors
+    backend.models.dataset._team_perf for live consistency."""
+    row = conn.execute(
+        """
+        SELECT AVG(pg.kills) AS k, AVG(pg.deaths) AS d, AVG(pg.assists) AS a,
+               AVG(pg.gold) AS g, AVG(pg.cs) AS cs, AVG(m.gamelength) AS gl
+        FROM player_games pg
+        JOIN matches m ON m.game_id = pg.game_id
+        WHERE pg.team = :t
+        """,
+        {"t": team},
+    ).fetchone()
+    k = row["k"] or 0; d = row["d"] or 0; a = row["a"] or 0
+    g = row["g"] or 0; cs = row["cs"] or 0; gl = row["gl"] or 30
+    gl_min = max(gl, 1.0)
+    return {"kda": (k + a) / max(d, 1.0), "gpm": g / gl_min, "cspm": cs / gl_min}
+
+
 def _team_recent(conn: sqlite3.Connection, team: str) -> Dict[str, float]:
     """Win rate, side win rates, avg gamelength for a team across the window."""
     row = conn.execute(
@@ -84,10 +133,15 @@ def _team_recent(conn: sqlite3.Connection, team: str) -> Dict[str, float]:
 
     return {
         "games":      float(games),
-        "winrate":    wr,
-        "blue_wr":    (side_blue["w"] or 0) / (side_blue["g"] or 1) if side_blue["g"] else 0.0,
-        "red_wr":     (side_red["w"]  or 0) / (side_red["g"]  or 1) if side_red["g"] else 0.0,
-        "avg_len":    float(row["avg_len"] or 0.0),
+        # `winrate_raw` is the "what fans would say" stat shown in the UI;
+        # `winrate` is shrunken and is what the model consumes.
+        "winrate_raw":  wr,
+        "winrate":      _shrink(wins, games),
+        "blue_wr":      _shrink(side_blue["w"] or 0, side_blue["g"] or 0),
+        "red_wr":       _shrink(side_red["w"]  or 0, side_red["g"]  or 0),
+        "blue_wr_raw":  (side_blue["w"] or 0) / (side_blue["g"] or 1) if side_blue["g"] else 0.0,
+        "red_wr_raw":   (side_red["w"]  or 0) / (side_red["g"]  or 1) if side_red["g"] else 0.0,
+        "avg_len":      float(row["avg_len"] or 0.0),
     }
 
 
@@ -106,9 +160,11 @@ def _h2h(conn: sqlite3.Connection, team1: str, team2: str) -> Dict[str, float]:
         {"a": team1, "b": team2},
     ).fetchone()
     g = row["g"] or 0
+    w = row["a_wins"] or 0
     return {
-        "h2h_games":   float(g),
-        "h2h_team1_wr": (row["a_wins"] or 0) / g if g else 0.5,
+        "h2h_games":     float(g),
+        "h2h_team1_wr":  _shrink(w, g, 0.5, k=4.0),  # match dataset.py
+        "h2h_team1_raw": (w / g) if g else 0.5,
     }
 
 
@@ -234,6 +290,11 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
             tr = _team_recent(conn, team)
             for k, v in tr.items():
                 feats[f"{prefix}_{k}"] = v
+            feats[f"{prefix}_recent_wr"] = _team_recent_form(conn, team, last_n=5)
+            perf = _team_perf(conn, team)
+            feats[f"{prefix}_kda"]  = perf["kda"]
+            feats[f"{prefix}_gpm"]  = perf["gpm"]
+            feats[f"{prefix}_cspm"] = perf["cspm"]
 
         h = _h2h(conn, inp.team1, inp.team2)
         feats.update(h)
@@ -250,36 +311,57 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
         for prefix, players in (("team1", team1_picks), ("team2", team2_picks)):
             wr_sum = 0.0
             kda_sum = 0.0
-            cwr_sum = 0.0; cwr_n = 0
-            gwr_sum = 0.0; gwr_n = 0
-            lwr_sum = 0.0; lwr_n = 0
+            cwr_sum = 0.0
+            gwr_sum = 0.0
+            lwr_sum = 0.0
+            cwr_n_raw = 0          # picks where the player has any history on this champ
+            pchamp_n_total = 0.0   # total games of player-on-champ history across the 5 picks
             for sel in players:
                 pr = _player_recent(conn, sel.player)
                 pc = _player_champ(conn, sel.player, sel.champion)
                 cg = _champion_global(conn, sel.champion)
                 wr_sum  += pr["winrate"]
                 kda_sum += pr["kda"]
-                if pc["champ_games"] > 0:
-                    cwr_sum += pc["champ_winrate"]
-                    cwr_n   += 1
-                # League-specific WR with cross-league fallback. When the
-                # in-league sample is too thin (<5g), reuse the global number
-                # so the feature is still informative.
-                in_league = _champion_global(conn, sel.champion, league=league) if league else None
-                if in_league and in_league["games"] >= 5:
-                    lwr_sum += in_league["winrate"]; lwr_n += 1
-                elif cg["games"] >= 3:
-                    lwr_sum += cg["winrate"]; lwr_n += 1
-                if cg["games"] >= 3:
-                    gwr_sum += cg["winrate"]
-                    gwr_n   += 1
+
+                # Player-on-champ: shrink toward the player's overall WR (or 0.5
+                # if the player has <5 games of any kind). With shrinkage, a 1-0
+                # pick on a new champ shows ~player_overall, not 100%.
+                player_prior = pr["winrate"] if pr["games"] >= 5 else 0.5
+                cwr_sum += _shrink(
+                    pc["champ_games"] * pc["champ_winrate"],  # implicit "wins"
+                    pc["champ_games"], player_prior,
+                )
+                cwr_n_raw += 1 if pc["champ_games"] > 0 else 0
+                pchamp_n_total += pc["champ_games"]
+
+                # Champion global WR — shrunken toward 0.5.
+                gwr_sum += _shrink(
+                    cg["games"] * cg["winrate"], cg["games"], 0.5,
+                )
+
+                # League-filtered WR. Use global rate as prior when in-league
+                # sample is thin, so a champ with no league history falls back to
+                # global rather than to 0.5.
+                global_rate = cg["winrate"] if cg["games"] >= 5 else 0.5
+                if league:
+                    in_league = _champion_global(conn, sel.champion, league=league)
+                    lwr_sum += _shrink(
+                        in_league["games"] * in_league["winrate"],
+                        in_league["games"], global_rate,
+                    )
+                else:
+                    lwr_sum += _shrink(
+                        cg["games"] * cg["winrate"], cg["games"], 0.5,
+                    )
+
             n = max(len(players), 1)
             feats[f"{prefix}_player_wr_avg"]    = wr_sum / n
             feats[f"{prefix}_player_kda_avg"]   = kda_sum / n
-            feats[f"{prefix}_player_champ_wr"]  = (cwr_sum / cwr_n) if cwr_n else 0.5
-            feats[f"{prefix}_player_champ_n"]   = float(cwr_n)
-            feats[f"{prefix}_champ_global_wr"]  = (gwr_sum / gwr_n) if gwr_n else 0.5
-            feats[f"{prefix}_champ_league_wr"]  = (lwr_sum / lwr_n) if lwr_n else 0.5
+            feats[f"{prefix}_player_champ_wr"]  = cwr_sum / n
+            feats[f"{prefix}_player_champ_n"]   = float(cwr_n_raw)
+            feats[f"{prefix}_pchamp_n_total"]   = float(pchamp_n_total)
+            feats[f"{prefix}_champ_global_wr"]  = gwr_sum / n
+            feats[f"{prefix}_champ_league_wr"]  = lwr_sum / n
 
         # Per-role champion-vs-champion matchup WR (team1 perspective).
         by_role_t1 = {p.role: p.champion for p in team1_picks if p.role and p.champion}
