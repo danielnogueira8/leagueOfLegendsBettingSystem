@@ -667,11 +667,11 @@ def _explain_prediction(model, cols: list[str], mfeats: dict, full_p: float) -> 
 
 
 def _per_lane_advantage(team1_picks, team2_picks, feats) -> list[dict]:
-    """Per-role lane advantage based on the live feature lookups we already did.
-
-    For each role where both teams have a champion (and ideally a player) filled,
-    return who is favored using player-on-champion WR (when both samples exist),
-    falling back to champion-vs-champion matchup WR.
+    """Per-role lane advantage. Returns two independent edges per role so the
+    frontend can show them as separate bars:
+      - player_edge:  pc1_wr - pc2_wr (None if either side lacks sample >= 2)
+      - matchup_edge: cm_wr - 0.5  (None if matchup sample < 5)
+    Plus the raw stats so chips can display percentages.
     """
     if not (team1_picks and team2_picks):
         return []
@@ -679,7 +679,7 @@ def _per_lane_advantage(team1_picks, team2_picks, feats) -> list[dict]:
     by_role_t2 = {p.role: p for p in team2_picks if p.role and p.champion}
     out = []
     with get_conn() as conn:
-        from backend.features.build import _player_champ, _champion_matchup, _champion_global
+        from backend.features.build import _player_champ, _champion_matchup
         for role in ("Top", "Jungle", "Mid", "Bot", "Support"):
             s1 = by_role_t1.get(role); s2 = by_role_t2.get(role)
             if not (s1 and s2):
@@ -691,30 +691,28 @@ def _per_lane_advantage(team1_picks, team2_picks, feats) -> list[dict]:
                 "team1_champion": s1.champion,
                 "team2_player":   s2.player or None,
                 "team2_champion": s2.champion,
+                # Champion-vs-champion matchup
                 "matchup_games":   int(cm["games"]),
                 "matchup_team1_wr": round(cm["winrate"], 4) if cm["games"] else None,
+                "matchup_edge":    round(cm["winrate"] - 0.5, 4) if cm["games"] >= 5 else None,
+                # Player-on-champion (filled below when sample exists)
+                "team1_player_champ_wr":    None,
+                "team2_player_champ_wr":    None,
+                "team1_player_champ_games": 0,
+                "team2_player_champ_games": 0,
+                "player_edge": None,
             }
-            # Prefer player-on-champion when both have meaningful samples.
             if s1.player and s2.player:
                 pc1 = _player_champ(conn, s1.player, s1.champion)
                 pc2 = _player_champ(conn, s2.player, s2.champion)
-                if pc1["champ_games"] >= 2 and pc2["champ_games"] >= 2:
+                entry["team1_player_champ_games"] = int(pc1["champ_games"])
+                entry["team2_player_champ_games"] = int(pc2["champ_games"])
+                if pc1["champ_games"] >= 1:
                     entry["team1_player_champ_wr"] = round(pc1["champ_winrate"], 4)
+                if pc2["champ_games"] >= 1:
                     entry["team2_player_champ_wr"] = round(pc2["champ_winrate"], 4)
-                    entry["team1_player_champ_games"] = int(pc1["champ_games"])
-                    entry["team2_player_champ_games"] = int(pc2["champ_games"])
-                    entry["edge"] = round(pc1["champ_winrate"] - pc2["champ_winrate"], 4)
-                    entry["edge_basis"] = "player-on-champion"
-            if "edge" not in entry:
-                if cm["games"] >= 5:
-                    entry["edge"] = round(cm["winrate"] - 0.5, 4) * 2  # scale to [-1,1]
-                    entry["edge_basis"] = "champion-matchup"
-                else:
-                    # Fall back to champion-pool strength.
-                    cg1 = _champion_global(conn, s1.champion)
-                    cg2 = _champion_global(conn, s2.champion)
-                    entry["edge"] = round(cg1["winrate"] - cg2["winrate"], 4)
-                    entry["edge_basis"] = "champion-global"
+                if pc1["champ_games"] >= 2 and pc2["champ_games"] >= 2:
+                    entry["player_edge"] = round(pc1["champ_winrate"] - pc2["champ_winrate"], 4)
             out.append(entry)
     return out
 

@@ -129,24 +129,42 @@
     .role.has-stats { padding-bottom: 6px; }
     .role .lane-edge {
       grid-column: 1 / -1;
-      display: none; align-items: center; gap: 6px;
+      display: none; flex-direction: column; gap: 4px;
       font-size: 11px; color: var(--muted);
-      padding-top: 4px;
+      padding-top: 6px;
     }
     .role.has-edge .lane-edge { display: flex; }
-    .lane-edge .arrow { font-weight: 800; font-size: 13px; }
-    .lane-edge .arrow.left  { color: var(--blue); }
-    .lane-edge .arrow.right { color: var(--red); }
+    .lane-edge .row {
+      display: grid; grid-template-columns: 50px 1fr 50px;
+      align-items: center; gap: 8px;
+    }
+    .lane-edge .row .kind {
+      font-size: 10px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: 0.05em; font-weight: 600;
+    }
+    .lane-edge .row .who {
+      text-align: right; font-size: 10px; color: var(--muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .lane-edge .row .who.t1 { color: var(--blue); }
+    .lane-edge .row .who.t2 { color: var(--red); }
     .lane-edge .meter {
-      flex: 1; height: 4px; border-radius: 4px; overflow: hidden;
+      height: 4px; border-radius: 4px; overflow: visible;
       background: var(--bg2); position: relative; border: 1px solid var(--border);
     }
+    .lane-edge .meter .center {
+      position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px;
+      background: var(--border-hi);
+    }
     .lane-edge .meter .fill {
-      position: absolute; top: 0; bottom: 0;
-      transition: all 250ms cubic-bezier(0.4, 0, 0.2, 1);
+      position: absolute; top: -1px; bottom: -1px;
+      transition: width 250ms cubic-bezier(0.4, 0, 0.2, 1);
+      border-radius: 2px;
     }
     .lane-edge .meter .fill.t1 { background: linear-gradient(90deg, var(--blue-deep), var(--blue)); right: 50%; }
     .lane-edge .meter .fill.t2 { background: linear-gradient(90deg, var(--red), var(--red-deep)); left: 50%; }
+    .lane-edge .row.empty .meter { opacity: 0.4; }
+    .lane-edge .row.empty .who { font-style: italic; }
 
     .why-card { margin-top: 14px; }
     .why-header {
@@ -715,33 +733,48 @@ function renderLaneEdges(lanes, t1, t2) {
     if (edge) edge.innerHTML = "";
   });
   if (!lanes.length) return;
-  const maxEdge = Math.max(...lanes.map(l => Math.abs(l.edge || 0)), 0.05);
+
+  // Scale player-edge and matchup-edge independently so each bar uses its
+  // own range — keeps both bars readable even though their natural scales
+  // differ (player-edge can hit ±1; matchup-edge tends to stay in ±0.2).
+  const maxPlayer  = Math.max(...lanes.map(l => Math.abs(l.player_edge  ?? 0)), 0.05);
+  const maxMatchup = Math.max(...lanes.map(l => Math.abs(l.matchup_edge ?? 0)), 0.05);
+
+  const buildRow = (kind, edge, max) => {
+    if (edge == null) {
+      return `
+        <div class="row empty">
+          <span class="kind">${kind}</span>
+          <div class="meter"><div class="center"></div></div>
+          <span class="who">no data</span>
+        </div>
+      `;
+    }
+    const widthPct = Math.min(50, (Math.abs(edge) / max) * 50);
+    const favored = edge > 0.005 ? t1 : (edge < -0.005 ? t2 : "even");
+    const cls = edge > 0.005 ? "t1" : (edge < -0.005 ? "t2" : "");
+    const fill = Math.abs(edge) > 0.005
+      ? `<div class="fill ${edge > 0 ? 't1' : 't2'}" style="width:${widthPct}%"></div>`
+      : "";
+    return `
+      <div class="row">
+        <span class="kind">${kind}</span>
+        <div class="meter">
+          <div class="center"></div>
+          ${fill}
+        </div>
+        <span class="who ${cls}">${favored}</span>
+      </div>
+    `;
+  };
 
   for (const lane of lanes) {
-    const edge = lane.edge || 0;
-    // Render in BOTH team panes so the chip is visible on either side.
+    const html = buildRow("Player", lane.player_edge, maxPlayer)
+               + buildRow("Matchup", lane.matchup_edge, maxMatchup);
     for (const hostId of ["t1roles", "t2roles"]) {
       const row = document.querySelector(`#${hostId} [data-role-row="${lane.role}"]`);
       if (!row) continue;
-      const target = row.querySelector(".lane-edge");
-      // Edge in [-1,1] (player-on-champion) or smaller for matchup-based.
-      const widthPct = Math.min(50, (Math.abs(edge) / maxEdge) * 50);
-      const arrowSide = edge > 0.005 ? "left" : (edge < -0.005 ? "right" : "");
-      const arrow = arrowSide === "left" ? "◄" : (arrowSide === "right" ? "►" : "·");
-      const favored = edge > 0.005 ? t1 : (edge < -0.005 ? t2 : "even");
-      const basisLabel = {
-        "player-on-champion": "player",
-        "champion-matchup":   "matchup",
-        "champion-global":    "champ",
-      }[lane.edge_basis] || "—";
-      target.innerHTML = `
-        <span class="arrow ${arrowSide}">${arrow}</span>
-        <span>${favored}</span>
-        <div class="meter">
-          <div class="fill ${edge >= 0 ? 't1' : 't2'}" style="width:${widthPct}%"></div>
-        </div>
-        <span class="muted">${basisLabel}</span>
-      `;
+      row.querySelector(".lane-edge").innerHTML = html;
       row.classList.add("has-edge");
     }
   }
