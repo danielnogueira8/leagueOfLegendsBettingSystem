@@ -20,17 +20,29 @@ The backend serves both the API and the frontend in a single service.
    LOL_DATA_DIR=/app/data
    LEAGUEPEDIA_USERNAME=YourFandomUser@BotName
    LEAGUEPEDIA_PASSWORD=long-bot-password
+   ADMIN_TOKEN=<a long random string you generate>
    ```
-   Get a bot password at https://lol.fandom.com/wiki/Special:BotPasswords
-   (grants needed: "Basic rights" + "High-volume editing").
+   - Get a Leaguepedia bot password at https://lol.fandom.com/wiki/Special:BotPasswords
+     (grants needed: "Basic rights" + "High-volume editing").
+   - `ADMIN_TOKEN` lets you trigger ingestion remotely without SSH (see step 5).
+     Generate one with `openssl rand -hex 32` or any password manager.
 
-5. **First deploy** will boot with an empty DB (`/health` returns 0 matches).
-   Open Railway's shell tab and run:
+5. **First deploy** boots with an empty DB (`/health` returns 0 matches).
+   Trigger ingestion + retrain from your laptop:
+   ```bash
+   APP=https://<your-app>.up.railway.app
+   TOKEN=<the ADMIN_TOKEN you set>
+
+   # kick off (returns immediately)
+   curl -X POST -H "X-Admin-Token: $TOKEN" $APP/admin/refresh
+
+   # follow progress live (~10 minutes)
+   curl -N -H "X-Admin-Token: $TOKEN" $APP/admin/refresh/stream
+
+   # or poll status with the last 50 log lines
+   curl -H "X-Admin-Token: $TOKEN" $APP/admin/refresh/status
    ```
-   python -m backend.refresh
-   ```
-   ~10 minutes. After it finishes, `/health` shows real numbers and the
-   frontend works.
+   After it finishes, `/health` shows real numbers and the frontend works.
 
 ## Visiting the app
 
@@ -42,9 +54,14 @@ The frontend autodetects the host, so no config needed.
 
 ## Keeping data fresh
 
-Set up a Railway cron job (Settings → Cron) to re-ingest periodically:
+Two options:
+
+**Cron (server-side)** — Railway cron job (Settings → Cron):
 - Schedule: `0 12 * * *` (daily at noon UTC) — fine for tracking new patches
 - Command: `python -m backend.refresh`
+
+**On-demand (client-side)** — re-run `curl -X POST -H "X-Admin-Token: $TOKEN"
+$APP/admin/refresh` whenever you want fresh data. Idempotent.
 
 ## Local development is unchanged
 
