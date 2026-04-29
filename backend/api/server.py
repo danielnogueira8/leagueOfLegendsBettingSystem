@@ -28,12 +28,18 @@ from pathlib import Path
 import requests as _requests
 
 from backend.config import USER_AGENT, DATA_DIR
-from backend.db.schema import get_conn
+from backend.db.schema import get_conn, init_db
 from backend.features.build import (
     MatchInput, PlayerSelection, build_features, baseline_probability,
 )
 from backend.models.train import load_model
 from backend.models.dataset import FEATURE_COLS
+
+# Ensure the SQLite schema exists at boot. On a fresh deploy with an empty
+# mounted volume (e.g. Railway) the DB file doesn't exist yet — without this,
+# every query 500s and the healthcheck never passes.
+init_db()
+print(f"[startup] DATA_DIR={DATA_DIR}", flush=True)
 
 app = FastAPI(title="LoL Betting System", version="0.1.0")
 app.add_middleware(
