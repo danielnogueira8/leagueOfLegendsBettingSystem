@@ -5,19 +5,86 @@ For each completed match in the DB, we generate one training row:
                (point-in-time correctness — no future leakage)
   - target:    1 if team1 won, 0 if team2 won
 
-The features mirror what backend.features.build does for live prediction, but
-restricted to history that pre-dates the match we're labeling. We avoid relying
-on the player→champion mapping for now (predictable at inference time only when
-the lineup is known).
+Key design choices that came out of debugging earlier versions:
+
+1.  Team and player WR are basically the same signal in pro LoL — players don't
+    flex teams mid-season, so averaging player WRs gives back the team WR.
+    We expose ONE winrate per side (team-level) and use player rows only for
+    KDA and per-champion specialization, not for redundant win-rate features.
+
+2.  Sparse features get *Bayesian-shrunk to 0.5* using `(w + k*0.5) / (g + k)`
+    instead of just `w/g`. This is critical for player-on-champion: with 0–2
+    games of history, raw `w/g` is either 0.0, 0.5, or 1.0, and the model
+    drastically overweights it. Shrinkage keeps tiny samples close to the
+    league prior and only lets the signal speak when sample size is real.
+
+3.  We exclude the raw `wr_diff` / `pchamp_diff` columns from the model — they
+    are linear combinations of the per-team columns and add nothing for a
+    linear model (and create instability for tree models). They stay on the
+    output dict only because the API surfaces them in /predict for display.
 """
 from __future__ import annotations
 import sqlite3
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from backend.db.schema import get_conn
 
 
+# Each side has 5 player rows per game. AVG over player_games gives 5 identical
+# values per match in 99% of cases, so we always derive team-side stats from
+# the matches table. _WIN_EXPR is for player_games rows only (champ-specific
+# aggregations).
+_WIN_EXPR = (
+    "CASE WHEN (pg.side = 'Blue' AND m.team1_side = 'Blue' AND m.winner = 1) "
+    "       OR (pg.side = 'Blue' AND m.team2_side = 'Blue' AND m.winner = 2) "
+    "       OR (pg.side = 'Red'  AND m.team1_side = 'Red'  AND m.winner = 1) "
+    "       OR (pg.side = 'Red'  AND m.team2_side = 'Red'  AND m.winner = 2) "
+    "  THEN 1 ELSE 0 END"
+)
+
+
+# Bayesian shrinkage prior. `k` = "virtual games at the prior". Smaller k
+# means we trust the data faster, larger k means we cling to the prior longer.
+# 10 is a reasonable default for pro LoL champion stats.
+SHRINK_K = 10.0
+
+
+def _shrink(wins: float, games: float, prior: float = 0.5, k: float = SHRINK_K) -> float:
+    """Bayesian shrinkage of an empirical winrate toward `prior`.
+
+    With games=0 returns prior. With games>>k returns wins/games.
+    """
+    return (wins + k * prior) / (games + k)
+
+
 # ---------- Per-match aggregations from history ---------- #
+
+def _team_recent_form(conn: sqlite3.Connection, team: str, before: str,
+                      last_n: int = 5) -> Dict[str, float]:
+    """Win rate over the team's last `last_n` matches before `before`.
+
+    Recency matters in pro LoL — a team's record from 3 weeks ago may not
+    reflect current form. Lightly shrunken because the window is small.
+    """
+    rows = conn.execute(
+        """
+        SELECT team1, team2, winner FROM matches
+        WHERE (team1 = :t OR team2 = :t)
+          AND datetime_utc < :before
+        ORDER BY datetime_utc DESC
+        LIMIT :n
+        """,
+        {"t": team, "before": before, "n": last_n},
+    ).fetchall()
+    g = len(rows)
+    w = sum(1 for r in rows
+            if (r["team1"] == team and r["winner"] == 1)
+            or (r["team2"] == team and r["winner"] == 2))
+    return {
+        "games":    float(g),
+        "winrate":  _shrink(w, g, 0.5, k=2.0),
+    }
+
 
 def _team_form(conn: sqlite3.Connection, team: str, before: str) -> Dict[str, float]:
     row = conn.execute(
@@ -33,14 +100,18 @@ def _team_form(conn: sqlite3.Connection, team: str, before: str) -> Dict[str, fl
         {"t": team, "before": before},
     ).fetchone()
     g = row["games"] or 0
+    w = row["wins"] or 0
     return {
         "games":   float(g),
-        "winrate": (row["wins"] or 0) / g if g else 0.0,
-        "avg_len": float(row["avg_len"] or 0.0),
+        # Keep raw WR for display, but pass shrunken WR to the model so a 1-0
+        # team early in the split doesn't get treated as a 100% team.
+        "winrate":         (w / g) if g else 0.5,
+        "winrate_shrunk":  _shrink(w, g, 0.5, SHRINK_K),
+        "avg_len":         float(row["avg_len"] or 0.0),
     }
 
 
-def _team_side_form(conn: sqlite3.Connection, team: str, side: str, before: str) -> float:
+def _team_side_form(conn: sqlite3.Connection, team: str, side: str, before: str) -> Dict[str, float]:
     """Side-specific historical winrate for `team` on `side` ('Blue'/'Red')."""
     row = conn.execute(
         """
@@ -60,7 +131,11 @@ def _team_side_form(conn: sqlite3.Connection, team: str, side: str, before: str)
         {"t": team, "s": side, "before": before},
     ).fetchone()
     g = row["g"] or 0
-    return (row["w"] or 0) / g if g else 0.0
+    w = row["w"] or 0
+    return {
+        "games":          float(g),
+        "winrate_shrunk": _shrink(w, g, 0.5, SHRINK_K),
+    }
 
 
 def _h2h(conn: sqlite3.Connection, a: str, b: str, before: str) -> Tuple[float, float]:
@@ -79,47 +154,37 @@ def _h2h(conn: sqlite3.Connection, a: str, b: str, before: str) -> Tuple[float, 
         {"a": a, "b": b, "before": before},
     ).fetchone()
     g = row["g"] or 0
-    return float(g), ((row["aw"] or 0) / g if g else 0.5)
+    w = row["aw"] or 0
+    # Heavy shrink — H2H samples are tiny and noisy.
+    return float(g), _shrink(w, g, 0.5, k=4.0)
 
 
-_WIN_EXPR = (
-    "CASE WHEN (pg.side = 'Blue' AND m.team1_side = 'Blue' AND m.winner = 1) "
-    "       OR (pg.side = 'Blue' AND m.team2_side = 'Blue' AND m.winner = 2) "
-    "       OR (pg.side = 'Red'  AND m.team1_side = 'Red'  AND m.winner = 1) "
-    "       OR (pg.side = 'Red'  AND m.team2_side = 'Red'  AND m.winner = 2) "
-    "  THEN 1 ELSE 0 END"
-)
-
-
-def _team_player_form(conn: sqlite3.Connection, team: str, before: str) -> Dict[str, float]:
-    """Roster-aggregate form for the team's players, prior to `before`.
-
-    `pg.win` is unreliable in our ingestion (often NULL), so derive wins via
-    the matches join on side.
+def _team_perf(conn: sqlite3.Connection, team: str, before: str) -> Dict[str, float]:
+    """Aggregate per-game performance metrics for the team's roster over the
+    patch window: KDA, gold per minute, CS per minute. These are slow-moving,
+    independent of pure W/L, and pick up "this team plays harder" signal.
     """
     row = conn.execute(
-        f"""
-        SELECT
-            COUNT(*) AS games,
-            SUM({_WIN_EXPR}) AS wins,
-            AVG(pg.kills) AS k,
-            AVG(pg.deaths) AS d,
-            AVG(pg.assists) AS a
+        """
+        SELECT AVG(pg.kills) AS k, AVG(pg.deaths) AS d, AVG(pg.assists) AS a,
+               AVG(pg.gold) AS g, AVG(pg.cs) AS cs, AVG(m.gamelength) AS gl
         FROM player_games pg
         JOIN matches m ON m.game_id = pg.game_id
-        WHERE pg.team = :t
-          AND m.datetime_utc < :before
+        WHERE pg.team = :t AND m.datetime_utc < :before
         """,
         {"t": team, "before": before},
     ).fetchone()
-    g = row["games"] or 0
-    w = row["wins"] or 0
-    deaths = row["d"] or 0
-    kda = ((row["k"] or 0) + (row["a"] or 0)) / max(deaths, 1.0)
+    k = row["k"] or 0
+    d = row["d"] or 0
+    a = row["a"] or 0
+    g = row["g"] or 0
+    cs = row["cs"] or 0
+    gl = row["gl"] or 30  # minutes; default to ~30 min when no history
+    gl_min = max(gl, 1.0)
     return {
-        "p_games":   float(g),
-        "p_winrate": (w / g) if g else 0.0,
-        "p_kda":     float(kda),
+        "kda":   (k + a) / max(d, 1.0),
+        "gpm":   g / gl_min,
+        "cspm":  cs / gl_min,
     }
 
 
@@ -129,15 +194,16 @@ def _team_champion_form(
     before: str,
     league: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
-    """For each side of `game_id`, compute aggregate champion-pool stats prior to
-    `before`:
-      - global_wr:           average global WR of each champion picked
-      - league_wr:           average WR of each champion picked, filtered to `league`
-                             when given (with a global fallback when in-league sample
-                             is too thin)
-      - player_on_champ_wr:  average of (this player's WR on this champion)
-      - matchup_wr:          average WR of (champion1 vs same-role champion2),
-                             team1 perspective
+    """For each side of `game_id`, compute aggregate champion-pool stats prior
+    to `before`. All values are Bayesian-shrunk toward 0.5 so picks with thin
+    history don't blow up the prediction.
+
+    Returns:
+      {
+        'team1': { 'global_wr', 'league_wr', 'pchamp_wr', 'matchup_wr',
+                   'pchamp_n_total': total games-of-history across the 5 picks },
+        'team2': {...},
+      }
     """
     picks = conn.execute(
         """
@@ -147,11 +213,11 @@ def _team_champion_form(
         """,
         {"g": game_id},
     ).fetchall()
+    empty = {"global_wr": 0.5, "league_wr": 0.5, "pchamp_wr": 0.5,
+             "matchup_wr": 0.5, "pchamp_n_total": 0.0}
     if not picks:
-        empty = {"global_wr": 0.5, "league_wr": 0.5, "player_on_champ_wr": 0.5, "matchup_wr": 0.5, "n": 0.0}
         return {"team1": dict(empty), "team2": dict(empty)}
 
-    # Identify which side is team1 vs team2 for this match.
     m_row = conn.execute(
         "SELECT team1_side FROM matches WHERE game_id = :g", {"g": game_id},
     ).fetchone()
@@ -166,10 +232,12 @@ def _team_champion_form(
 
     out: Dict[str, Dict[str, float]] = {}
     for bucket, picks_list in by_team.items():
-        gw_sum = 0.0; gw_n = 0
-        lw_sum = 0.0; lw_n = 0
-        pw_sum = 0.0; pw_n = 0
+        gw_sum = 0.0
+        lw_sum = 0.0
+        pw_sum = 0.0
+        pchamp_n_total = 0.0
         for sel in picks_list:
+            # Global WR for this champion (any pro game in window, prior to `before`).
             r = conn.execute(
                 f"""
                 SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
@@ -179,9 +247,9 @@ def _team_champion_form(
                 {"c": sel["champion"], "before": before},
             ).fetchone()
             g, w = r["g"] or 0, r["w"] or 0
-            if g >= 3:
-                gw_sum += w / g; gw_n += 1
-            # League-filtered WR with cross-league fallback when in-league is sparse.
+            gw_sum += _shrink(w, g, 0.5, SHRINK_K)
+
+            # League-filtered WR (with global fallback through shrinkage prior).
             if league:
                 rl = conn.execute(
                     f"""
@@ -194,12 +262,16 @@ def _team_champion_form(
                     {"c": sel["champion"], "before": before, "lg": league},
                 ).fetchone()
                 gl, wl = rl["g"] or 0, rl["w"] or 0
-                if gl >= 5:
-                    lw_sum += wl / gl; lw_n += 1
-                elif g >= 3:
-                    lw_sum += w / g; lw_n += 1
-            elif g >= 3:
-                lw_sum += w / g; lw_n += 1
+                # Use the global rate as the prior for the league rate so an
+                # unseen-in-this-league pick falls back to global, not 0.5.
+                global_rate = (w / g) if g >= 5 else 0.5
+                lw_sum += _shrink(wl, gl, global_rate, SHRINK_K)
+            else:
+                lw_sum += _shrink(w, g, 0.5, SHRINK_K)
+
+            # Player-on-champion WR. THIS IS THE BIG ONE — Bayesian shrinkage
+            # toward the player's overall WR so a 1-0 mastery doesn't
+            # show as 100%.
             r2 = conn.execute(
                 f"""
                 SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
@@ -209,13 +281,26 @@ def _team_champion_form(
                 {"p": sel["player"], "c": sel["champion"], "before": before},
             ).fetchone()
             g2, w2 = r2["g"] or 0, r2["w"] or 0
-            if g2 >= 1:
-                pw_sum += w2 / g2; pw_n += 1
+            # Player's overall WR (prior).
+            r3 = conn.execute(
+                f"""
+                SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
+                FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+                WHERE pg.player = :p AND m.datetime_utc < :before
+                """,
+                {"p": sel["player"], "before": before},
+            ).fetchone()
+            g3, w3 = r3["g"] or 0, r3["w"] or 0
+            player_overall = (w3 / g3) if g3 >= 5 else 0.5
+            pw_sum += _shrink(w2, g2, player_overall, SHRINK_K)
+            pchamp_n_total += g2
+
+        n = max(len(picks_list), 1)
         out[bucket] = {
-            "global_wr": (gw_sum / gw_n) if gw_n else 0.5,
-            "league_wr": (lw_sum / lw_n) if lw_n else 0.5,
-            "player_on_champ_wr": (pw_sum / pw_n) if pw_n else 0.5,
-            "n": float(len(picks_list)),
+            "global_wr":      gw_sum / n,
+            "league_wr":      lw_sum / n,
+            "pchamp_wr":      pw_sum / n,
+            "pchamp_n_total": pchamp_n_total,
         }
 
     # Per-role champion matchup WR (team1 perspective).
@@ -224,9 +309,6 @@ def _team_champion_form(
         c1 = sides.get("team1"); c2 = sides.get("team2")
         if not (c1 and c2):
             continue
-        # WR of c1 when facing c2 in same game (any role on either side, not just same role,
-        # would conflate signals — but we only have lineup not pick-side mapping by role for
-        # historical games, so use "c1's WR in games where c2 was on the opposing team").
         r = conn.execute(
             f"""
             SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
@@ -249,13 +331,13 @@ def _team_champion_form(
     return out
 
 
-def build_training_rows() -> List[Dict[str, float]]:
+def build_training_rows() -> List[Dict[str, Any]]:
     """One row per labeled, completed match. Returns a list of feature dicts.
 
     Each row has a `target` key (1 = team1 won, 0 = team2 won) and a `match_dt`
     so callers can do time-based train/val splits.
     """
-    rows: List[Dict[str, float]] = []
+    rows: List[Dict[str, Any]] = []
     with get_conn() as conn:
         matches = conn.execute(
             """
@@ -274,66 +356,94 @@ def build_training_rows() -> List[Dict[str, float]]:
             before = m["datetime_utc"]
             tf1 = _team_form(conn, t1, before)
             tf2 = _team_form(conn, t2, before)
-            t1_side_wr = _team_side_form(conn, t1, m["team1_side"], before)
-            t2_side_wr = _team_side_form(conn, t2, m["team2_side"], before)
+            rf1 = _team_recent_form(conn, t1, before, last_n=5)
+            rf2 = _team_recent_form(conn, t2, before, last_n=5)
+            sf1 = _team_side_form(conn, t1, m["team1_side"], before)
+            sf2 = _team_side_form(conn, t2, m["team2_side"], before)
             h2h_g, h2h_t1wr = _h2h(conn, t1, t2, before)
-            pf1 = _team_player_form(conn, t1, before)
-            pf2 = _team_player_form(conn, t2, before)
+            perf1 = _team_perf(conn, t1, before)
+            perf2 = _team_perf(conn, t2, before)
             cf  = _team_champion_form(conn, m["game_id"], before, league=m["league_code"])
 
-            row = {
+            row: Dict[str, Any] = {
                 "match_dt":          before,
                 "league_code":       m["league_code"] or "",
-                "team1_games":       tf1["games"],
-                "team1_winrate":     tf1["winrate"],
-                "team1_avg_len":     tf1["avg_len"],
-                "team2_games":       tf2["games"],
-                "team2_winrate":     tf2["winrate"],
-                "team2_avg_len":     tf2["avg_len"],
-                "team1_side_wr":     t1_side_wr,
-                "team2_side_wr":     t2_side_wr,
-                "team1_side_blue":   1.0 if m["team1_side"] == "Blue" else 0.0,
-                "h2h_games":         h2h_g,
-                "h2h_team1_wr":      h2h_t1wr,
-                "team1_p_games":     pf1["p_games"],
-                "team1_p_winrate":   pf1["p_winrate"],
-                "team1_p_kda":       pf1["p_kda"],
-                "team2_p_games":     pf2["p_games"],
-                "team2_p_winrate":   pf2["p_winrate"],
-                "team2_p_kda":       pf2["p_kda"],
+                # ---- team form ----
+                "team1_games":           tf1["games"],
+                "team2_games":           tf2["games"],
+                "team1_winrate":         tf1["winrate_shrunk"],
+                "team2_winrate":         tf2["winrate_shrunk"],
+                "team1_avg_len":         tf1["avg_len"],
+                "team2_avg_len":         tf2["avg_len"],
+                "team1_kda":             perf1["kda"],
+                "team2_kda":             perf2["kda"],
+                "kda_diff":              perf1["kda"] - perf2["kda"],
+                "team1_gpm":             perf1["gpm"],
+                "team2_gpm":             perf2["gpm"],
+                "gpm_diff":              perf1["gpm"] - perf2["gpm"],
+                "team1_cspm":            perf1["cspm"],
+                "team2_cspm":            perf2["cspm"],
+                "cspm_diff":             perf1["cspm"] - perf2["cspm"],
+                "team1_recent_wr":       rf1["winrate"],
+                "team2_recent_wr":       rf2["winrate"],
+                "recent_wr_diff":        rf1["winrate"] - rf2["winrate"],
+                # ---- side ----
+                "team1_side_wr":         sf1["winrate_shrunk"],
+                "team2_side_wr":         sf2["winrate_shrunk"],
+                "team1_side_blue":       1.0 if m["team1_side"] == "Blue" else 0.0,
+                # ---- h2h ----
+                "h2h_games":             h2h_g,
+                "h2h_team1_wr":          h2h_t1wr,
+                # ---- champion / draft ----
                 "team1_champ_global_wr": cf["team1"]["global_wr"],
                 "team2_champ_global_wr": cf["team2"]["global_wr"],
                 "team1_champ_league_wr": cf["team1"]["league_wr"],
                 "team2_champ_league_wr": cf["team2"]["league_wr"],
-                "team1_pchamp_wr":       cf["team1"]["player_on_champ_wr"],
-                "team2_pchamp_wr":       cf["team2"]["player_on_champ_wr"],
+                "team1_pchamp_wr":       cf["team1"]["pchamp_wr"],
+                "team2_pchamp_wr":       cf["team2"]["pchamp_wr"],
+                "team1_pchamp_n":        cf["team1"]["pchamp_n_total"],
+                "team2_pchamp_n":        cf["team2"]["pchamp_n_total"],
                 "champ_matchup_wr":      cf["team1"]["matchup_wr"],
-                "wr_diff":           tf1["winrate"] - tf2["winrate"],
-                "p_wr_diff":         pf1["p_winrate"] - pf2["p_winrate"],
-                "side_wr_diff":      t1_side_wr - t2_side_wr,
-                "champ_global_diff": cf["team1"]["global_wr"] - cf["team2"]["global_wr"],
-                "champ_league_diff": cf["team1"]["league_wr"] - cf["team2"]["league_wr"],
-                "pchamp_diff":       cf["team1"]["player_on_champ_wr"] - cf["team2"]["player_on_champ_wr"],
-                "target":            1 if m["winner"] == 1 else 0,
+                # ---- explicit difference signals ----
+                # The "favorite" baseline (sign(team1_wr - team2_wr)) hits ~74%
+                # on its own. Giving the linear model the diff directly stops it
+                # from having to learn it from two correlated columns and frees
+                # the per-team WRs to encode "which side has a stronger denominator".
+                "wr_diff":               tf1["winrate_shrunk"] - tf2["winrate_shrunk"],
+                "champ_global_diff":     cf["team1"]["global_wr"] - cf["team2"]["global_wr"],
+                "champ_league_diff":     cf["team1"]["league_wr"] - cf["team2"]["league_wr"],
+                "pchamp_diff":           cf["team1"]["pchamp_wr"] - cf["team2"]["pchamp_wr"],
+                # ---- target ----
+                "target":                1 if m["winner"] == 1 else 0,
             }
             rows.append(row)
 
     return rows
 
 
-# Feature columns the model uses (excludes meta cols match_dt / league_code / target).
+# Feature columns the model uses. Note: we deliberately omit the *_diff
+# columns — they're linear combinations of the per-team columns and a
+# linear model can already form them through coefficients. Including them
+# just splits weight and creates instability.
 FEATURE_COLS: List[str] = [
-    "team1_games", "team1_winrate", "team1_avg_len",
-    "team2_games", "team2_winrate", "team2_avg_len",
+    # Team form
+    "team1_games",   "team2_games",
+    "team1_winrate", "team2_winrate",       "wr_diff",
+    "team1_recent_wr", "team2_recent_wr",   "recent_wr_diff",
+    "team1_kda",     "team2_kda",     "kda_diff",
+    "team1_gpm",     "team2_gpm",     "gpm_diff",
+    "team1_cspm",    "team2_cspm",    "cspm_diff",
+    "team1_avg_len", "team2_avg_len",
+    # Side
     "team1_side_wr", "team2_side_wr", "team1_side_blue",
+    # H2H
     "h2h_games", "h2h_team1_wr",
-    "team1_p_games", "team1_p_winrate", "team1_p_kda",
-    "team2_p_games", "team2_p_winrate", "team2_p_kda",
-    "team1_champ_global_wr", "team2_champ_global_wr",
-    "team1_champ_league_wr", "team2_champ_league_wr",
-    "team1_pchamp_wr", "team2_pchamp_wr", "champ_matchup_wr",
-    "wr_diff", "p_wr_diff", "side_wr_diff",
-    "champ_global_diff", "champ_league_diff", "pchamp_diff",
+    # Champion / draft (all shrunken)
+    "team1_champ_global_wr", "team2_champ_global_wr", "champ_global_diff",
+    "team1_champ_league_wr", "team2_champ_league_wr", "champ_league_diff",
+    "team1_pchamp_wr",       "team2_pchamp_wr",       "pchamp_diff",
+    "team1_pchamp_n",        "team2_pchamp_n",
+    "champ_matchup_wr",
 ]
 
 
@@ -342,5 +452,7 @@ if __name__ == "__main__":
     rows = build_training_rows()
     print(f"Built {len(rows)} training rows")
     if rows:
+        # Sanity-check: team1_winrate and team2_winrate should NOT be a
+        # linear function of any other column.
         print("First row:", json.dumps(rows[0], indent=2))
         print("Last row:",  json.dumps(rows[-1], indent=2))
