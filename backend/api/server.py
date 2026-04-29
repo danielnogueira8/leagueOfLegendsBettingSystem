@@ -12,11 +12,15 @@ Endpoints:
   POST /predict                 -> heuristic probability for a matchup
 """
 from __future__ import annotations
+import asyncio
+import os
+import secrets
+import threading
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -766,6 +770,151 @@ def predict(req: PredictRequest):
         "explanation": explanation,
         "lane_advantages": lanes,
     }
+
+
+# ---------- Admin: trigger ingestion + retrain remotely ---------- #
+#
+# Avoids needing SSH/CLI shell access to the container. Auth is a single shared
+# secret in the ADMIN_TOKEN env var. If the var is missing we 503, never accept
+# unauthenticated calls.
+
+_REFRESH_LOCK = threading.Lock()
+_REFRESH_STATE: dict = {
+    "running":     False,
+    "started_at":  None,
+    "finished_at": None,
+    "summary":     None,
+    "error":       None,
+    "log_tail":    [],   # capped list of recent stdout lines
+}
+_LOG_TAIL_MAX = 400
+
+
+def _check_admin_token(authorization: Optional[str], x_admin_token: Optional[str]) -> None:
+    expected = os.environ.get("ADMIN_TOKEN")
+    if not expected:
+        raise HTTPException(503, "ADMIN_TOKEN not configured on server")
+    provided = x_admin_token
+    if not provided and authorization and authorization.lower().startswith("bearer "):
+        provided = authorization.split(None, 1)[1].strip()
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(401, "invalid admin token")
+
+
+def _run_refresh_job() -> None:
+    """Runs in a background thread. Streams output into _REFRESH_STATE["log_tail"]
+    so callers can poll progress."""
+    import sys
+    from backend.refresh import main as _refresh_main
+
+    class _TeeStream:
+        def __init__(self, original):
+            self.original = original
+            self.buf = ""
+        def write(self, s: str):
+            try:
+                self.original.write(s)
+                self.original.flush()
+            except Exception:
+                pass
+            self.buf += s
+            while "\n" in self.buf:
+                line, self.buf = self.buf.split("\n", 1)
+                if line:
+                    tail = _REFRESH_STATE["log_tail"]
+                    tail.append(line)
+                    if len(tail) > _LOG_TAIL_MAX:
+                        del tail[:len(tail) - _LOG_TAIL_MAX]
+        def flush(self):
+            try: self.original.flush()
+            except Exception: pass
+
+    real_out = sys.stdout
+    real_err = sys.stderr
+    sys.stdout = _TeeStream(real_out)
+    sys.stderr = _TeeStream(real_err)
+    try:
+        rc = _refresh_main()
+        _REFRESH_STATE["summary"] = {"return_code": rc}
+        if rc != 0:
+            _REFRESH_STATE["error"] = f"refresh exited with code {rc}"
+    except Exception as e:
+        _REFRESH_STATE["error"] = repr(e)
+    finally:
+        sys.stdout = real_out
+        sys.stderr = real_err
+        _REFRESH_STATE["running"] = False
+        _REFRESH_STATE["finished_at"] = time.time()
+        # Drop response cache since underlying counts changed.
+        _CACHE.clear()
+
+
+@app.post("/admin/refresh")
+def admin_refresh(
+    authorization: Optional[str] = Header(None),
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+):
+    """Kick off ingestion + retrain in a background thread. Returns immediately.
+
+    Auth: send either `Authorization: Bearer <ADMIN_TOKEN>` or `X-Admin-Token: <ADMIN_TOKEN>`.
+    Poll progress at GET /admin/refresh/status.
+    """
+    _check_admin_token(authorization, x_admin_token)
+    with _REFRESH_LOCK:
+        if _REFRESH_STATE["running"]:
+            return {"running": True, "started_at": _REFRESH_STATE["started_at"],
+                    "message": "refresh already in progress"}
+        _REFRESH_STATE.update({
+            "running":     True,
+            "started_at":  time.time(),
+            "finished_at": None,
+            "summary":     None,
+            "error":       None,
+            "log_tail":    [],
+        })
+        threading.Thread(target=_run_refresh_job, daemon=True).start()
+    return {"running": True, "started_at": _REFRESH_STATE["started_at"],
+            "poll": "/admin/refresh/status"}
+
+
+@app.get("/admin/refresh/status")
+def admin_refresh_status(
+    authorization: Optional[str] = Header(None),
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+    tail: int = 50,
+):
+    _check_admin_token(authorization, x_admin_token)
+    s = dict(_REFRESH_STATE)
+    s["log_tail"] = s["log_tail"][-max(1, min(tail, _LOG_TAIL_MAX)):]
+    return s
+
+
+@app.get("/admin/refresh/stream")
+def admin_refresh_stream(
+    authorization: Optional[str] = Header(None),
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+):
+    """Server-Sent Events stream of the current refresh job.
+
+    Useful to follow progress live: `curl -N -H "X-Admin-Token: ..." .../admin/refresh/stream`.
+    """
+    _check_admin_token(authorization, x_admin_token)
+
+    def _gen():
+        last = 0
+        while True:
+            tail = _REFRESH_STATE["log_tail"]
+            if last < len(tail):
+                for line in tail[last:]:
+                    yield f"data: {line}\n\n"
+                last = len(tail)
+            if not _REFRESH_STATE["running"]:
+                # One last flush, then end.
+                yield f"event: end\ndata: {json.dumps({'error': _REFRESH_STATE['error']})}\n\n"
+                return
+            time.sleep(1.0)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 # Serve the static frontend when the directory is present alongside `backend/`.
