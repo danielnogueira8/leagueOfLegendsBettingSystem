@@ -111,44 +111,91 @@ def _h2h(conn: sqlite3.Connection, team1: str, team2: str) -> Dict[str, float]:
     }
 
 
+_WIN_EXPR = (
+    "CASE WHEN (pg.side = 'Blue' AND m.team1_side = 'Blue' AND m.winner = 1) "
+    "       OR (pg.side = 'Blue' AND m.team2_side = 'Blue' AND m.winner = 2) "
+    "       OR (pg.side = 'Red'  AND m.team1_side = 'Red'  AND m.winner = 1) "
+    "       OR (pg.side = 'Red'  AND m.team2_side = 'Red'  AND m.winner = 2) "
+    "  THEN 1 ELSE 0 END"
+)
+
+
 def _player_recent(conn: sqlite3.Connection, player: str) -> Dict[str, float]:
+    """Player's WR and KDA across the patch window. We derive wins via the
+    matches join because pg.win is unreliable in our ingestion."""
     row = conn.execute(
-        """
+        f"""
         SELECT
             COUNT(*)        AS games,
-            AVG(win)        AS wr,
-            AVG(kills)      AS k,
-            AVG(deaths)     AS d,
-            AVG(assists)    AS a
-        FROM player_games
-        WHERE player = :p
+            SUM({_WIN_EXPR}) AS wins,
+            AVG(pg.kills)   AS k,
+            AVG(pg.deaths)  AS d,
+            AVG(pg.assists) AS a
+        FROM player_games pg
+        JOIN matches m ON m.game_id = pg.game_id
+        WHERE pg.player = :p
         """,
         {"p": player},
     ).fetchone()
     g = row["games"] or 0
+    w = row["wins"] or 0
     deaths = row["d"] or 0
     kda = ((row["k"] or 0) + (row["a"] or 0)) / max(deaths, 1.0)
     return {
         "games":   float(g),
-        "winrate": float(row["wr"] or 0.0),
+        "winrate": (w / g) if g else 0.0,
         "kda":     float(kda),
     }
 
 
 def _player_champ(conn: sqlite3.Connection, player: str, champion: str) -> Dict[str, float]:
     row = conn.execute(
-        """
-        SELECT COUNT(*) AS games, AVG(win) AS wr
-        FROM player_games
-        WHERE player = :p AND champion = :c
+        f"""
+        SELECT COUNT(*) AS games, SUM({_WIN_EXPR}) AS wins
+        FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+        WHERE pg.player = :p AND pg.champion = :c
         """,
         {"p": player, "c": champion},
     ).fetchone()
     g = row["games"] or 0
+    w = row["wins"] or 0
     return {
         "champ_games":   float(g),
-        "champ_winrate": float(row["wr"] or 0.0),
+        "champ_winrate": (w / g) if g else 0.0,
     }
+
+
+def _champion_global(conn: sqlite3.Connection, champion: str) -> Dict[str, float]:
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
+        FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+        WHERE pg.champion = :c
+        """,
+        {"c": champion},
+    ).fetchone()
+    g = row["g"] or 0
+    w = row["w"] or 0
+    return {"games": float(g), "winrate": (w / g) if g else 0.5}
+
+
+def _champion_matchup(conn: sqlite3.Connection, c1: str, c2: str) -> Dict[str, float]:
+    """WR of c1 in games where c2 was on the opposing team. Symmetric: 1 - this
+    is c2's WR vs c1."""
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
+        FROM player_games pg
+        JOIN matches m ON m.game_id = pg.game_id
+        JOIN player_games opp ON opp.game_id = pg.game_id
+                             AND opp.side != pg.side
+        WHERE pg.champion = :c1 AND opp.champion = :c2
+        """,
+        {"c1": c1, "c2": c2},
+    ).fetchone()
+    g = row["g"] or 0
+    w = row["w"] or 0
+    return {"games": float(g), "winrate": (w / g) if g else 0.5}
 
 
 def build_features(inp: MatchInput) -> Dict[str, float]:
@@ -165,28 +212,49 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
 
         feats["team1_side_blue"] = 1.0 if inp.team1_side == "Blue" else 0.0
 
-        for prefix, players in (("team1", inp.team1_players or []), ("team2", inp.team2_players or [])):
+        team1_picks = inp.team1_players or []
+        team2_picks = inp.team2_players or []
+        for prefix, players in (("team1", team1_picks), ("team2", team2_picks)):
             wr_sum = 0.0
             kda_sum = 0.0
-            cwr_sum = 0.0
-            cwr_n = 0
+            cwr_sum = 0.0; cwr_n = 0
+            gwr_sum = 0.0; gwr_n = 0
             for sel in players:
                 pr = _player_recent(conn, sel.player)
                 pc = _player_champ(conn, sel.player, sel.champion)
+                cg = _champion_global(conn, sel.champion)
                 wr_sum  += pr["winrate"]
                 kda_sum += pr["kda"]
                 if pc["champ_games"] > 0:
                     cwr_sum += pc["champ_winrate"]
                     cwr_n   += 1
+                if cg["games"] >= 3:
+                    gwr_sum += cg["winrate"]
+                    gwr_n   += 1
             n = max(len(players), 1)
-            feats[f"{prefix}_player_wr_avg"]   = wr_sum / n
-            feats[f"{prefix}_player_kda_avg"]  = kda_sum / n
-            feats[f"{prefix}_player_champ_wr"] = (cwr_sum / cwr_n) if cwr_n else 0.5
-            feats[f"{prefix}_player_champ_n"]  = float(cwr_n)
+            feats[f"{prefix}_player_wr_avg"]    = wr_sum / n
+            feats[f"{prefix}_player_kda_avg"]   = kda_sum / n
+            feats[f"{prefix}_player_champ_wr"]  = (cwr_sum / cwr_n) if cwr_n else 0.5
+            feats[f"{prefix}_player_champ_n"]   = float(cwr_n)
+            feats[f"{prefix}_champ_global_wr"]  = (gwr_sum / gwr_n) if gwr_n else 0.5
 
-    feats["wr_diff"]     = feats["team1_winrate"] - feats["team2_winrate"]
-    feats["pwr_diff"]    = feats["team1_player_wr_avg"] - feats["team2_player_wr_avg"]
-    feats["champ_diff"]  = feats["team1_player_champ_wr"] - feats["team2_player_champ_wr"]
+        # Per-role champion-vs-champion matchup WR (team1 perspective).
+        by_role_t1 = {p.role: p.champion for p in team1_picks if p.role and p.champion}
+        by_role_t2 = {p.role: p.champion for p in team2_picks if p.role and p.champion}
+        mu_sum = 0.0; mu_n = 0
+        for role, c1 in by_role_t1.items():
+            c2 = by_role_t2.get(role)
+            if not c2:
+                continue
+            mu = _champion_matchup(conn, c1, c2)
+            if mu["games"] >= 3:
+                mu_sum += mu["winrate"]; mu_n += 1
+        feats["champ_matchup_wr"] = (mu_sum / mu_n) if mu_n else 0.5
+
+    feats["wr_diff"]           = feats["team1_winrate"] - feats["team2_winrate"]
+    feats["pwr_diff"]          = feats["team1_player_wr_avg"] - feats["team2_player_wr_avg"]
+    feats["champ_diff"]        = feats["team1_player_champ_wr"] - feats["team2_player_champ_wr"]
+    feats["champ_global_diff"] = feats["team1_champ_global_wr"] - feats["team2_champ_global_wr"]
     return feats
 
 

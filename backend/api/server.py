@@ -16,6 +16,8 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import json
@@ -349,6 +351,167 @@ def champions():
     return _ddragon_champions()
 
 
+@app.get("/champion-matchup")
+def champion_matchup(champion1: str, champion2: str, role: Optional[str] = None):
+    """Head-to-head WR for two champions facing each other (any role by default).
+
+    Returns champion1's WR in games where champion2 was on the opposing team.
+    `role` filters to picks of `champion1` in that role (so `Jhin` Bot vs `Ezreal`
+    excludes off-role appearances).
+    """
+    key = f"cm:{champion1}|{champion2}|{role or ''}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    win_expr = (
+        "CASE WHEN (pg.side = 'Blue' AND m.team1_side = 'Blue' AND m.winner = 1) "
+        "       OR (pg.side = 'Blue' AND m.team2_side = 'Blue' AND m.winner = 2) "
+        "       OR (pg.side = 'Red'  AND m.team1_side = 'Red'  AND m.winner = 1) "
+        "       OR (pg.side = 'Red'  AND m.team2_side = 'Red'  AND m.winner = 2) "
+        "  THEN 1 ELSE 0 END"
+    )
+    sql = f"""
+        SELECT COUNT(*) AS g, SUM({win_expr}) AS w
+        FROM player_games pg
+        JOIN matches m ON m.game_id = pg.game_id
+        JOIN player_games opp ON opp.game_id = pg.game_id
+                             AND opp.side != pg.side
+        WHERE pg.champion = ? AND opp.champion = ?
+    """
+    params: list = [champion1, champion2]
+    if role:
+        sql += " AND pg.role = ?"
+        params.append(role)
+    with get_conn() as conn:
+        row = conn.execute(sql, params).fetchone()
+    g = row["g"] or 0
+    w = row["w"] or 0
+    payload = {
+        "champion1": champion1,
+        "champion2": champion2,
+        "role": role,
+        "games":   g,
+        "wins":    w,
+        "winrate": (w / g) if g else None,
+    }
+    return _cache_put(key, payload)
+
+
+@app.get("/champion-stats")
+def champion_stats(
+    champion: str,
+    player: Optional[str] = None,
+    role: Optional[str] = None,
+):
+    """Win-rate stats for a champion in the patch window.
+
+    Returns the champion's overall WR plus, if `player` is provided, that
+    player's record on this champion and their broader form (in `role` if
+    given, else across all their games). `win` on player_games is unreliable
+    in our ingestion, so we derive it by joining with `matches` on side.
+    """
+    key = f"champstats:{champion}|{player or ''}|{role or ''}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    win_expr = (
+        "CASE WHEN (pg.side = 'Blue' AND m.team1_side = 'Blue' AND m.winner = 1) "
+        "       OR (pg.side = 'Blue' AND m.team2_side = 'Blue' AND m.winner = 2) "
+        "       OR (pg.side = 'Red'  AND m.team1_side = 'Red'  AND m.winner = 1) "
+        "       OR (pg.side = 'Red'  AND m.team2_side = 'Red'  AND m.winner = 2) "
+        "  THEN 1 ELSE 0 END"
+    )
+
+    payload: dict = {"champion": champion}
+    with get_conn() as conn:
+        # Global champion stats
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS games, SUM({win_expr}) AS wins,
+                   AVG(pg.kills) AS k, AVG(pg.deaths) AS d, AVG(pg.assists) AS a
+            FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+            WHERE pg.champion = ?
+            """,
+            (champion,),
+        ).fetchone()
+        g = row["games"] or 0
+        w = row["wins"] or 0
+        payload["global"] = {
+            "games":   g,
+            "wins":    w,
+            "winrate": (w / g) if g else None,
+            "avg_kda": ((row["k"] or 0) + (row["a"] or 0)) / max(row["d"] or 1, 1),
+        }
+
+        if player:
+            # Player on this champion
+            pc = conn.execute(
+                f"""
+                SELECT COUNT(*) AS games, SUM({win_expr}) AS wins,
+                       AVG(pg.kills) AS k, AVG(pg.deaths) AS d, AVG(pg.assists) AS a
+                FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+                WHERE pg.player = ? AND pg.champion = ?
+                """,
+                (player, champion),
+            ).fetchone()
+            pg_games = pc["games"] or 0
+            pg_wins  = pc["wins"] or 0
+            payload["player_on_champion"] = {
+                "player":  player,
+                "games":   pg_games,
+                "wins":    pg_wins,
+                "winrate": (pg_wins / pg_games) if pg_games else None,
+                "avg_kda": ((pc["k"] or 0) + (pc["a"] or 0)) / max(pc["d"] or 1, 1) if pg_games else None,
+            }
+
+            # Player overall (optionally scoped to role)
+            sql = f"""
+                SELECT COUNT(*) AS games, SUM({win_expr}) AS wins
+                FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+                WHERE pg.player = ?
+            """
+            params: list = [player]
+            if role:
+                sql += " AND pg.role = ?"
+                params.append(role)
+            po = conn.execute(sql, params).fetchone()
+            po_g = po["games"] or 0
+            po_w = po["wins"] or 0
+            payload["player_overall"] = {
+                "player":  player,
+                "role":    role,
+                "games":   po_g,
+                "wins":    po_w,
+                "winrate": (po_w / po_g) if po_g else None,
+            }
+
+            # Player's most-played champs in this role (top 5) for context
+            top_sql = f"""
+                SELECT pg.champion, COUNT(*) AS games, SUM({win_expr}) AS wins
+                FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+                WHERE pg.player = ?
+            """
+            top_params: list = [player]
+            if role:
+                top_sql += " AND pg.role = ?"
+                top_params.append(role)
+            top_sql += " GROUP BY pg.champion ORDER BY games DESC LIMIT 5"
+            top = conn.execute(top_sql, top_params).fetchall()
+            payload["player_top_champs"] = [
+                {
+                    "champion": r["champion"],
+                    "games":    r["games"],
+                    "wins":     r["wins"] or 0,
+                    "winrate":  (r["wins"] or 0) / r["games"] if r["games"] else None,
+                }
+                for r in top
+            ]
+
+    return _cache_put(key, payload)
+
+
 @app.get("/team/{team}/champion-pool")
 def team_champion_pool(team: str, role: Optional[str] = None):
     """Most-played champions for the team, optionally filtered by role.
@@ -396,6 +559,10 @@ def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: di
     """
     side_wr_t1 = feats.get("team1_blue_wr") if team1_side == "Blue" else feats.get("team1_red_wr")
     side_wr_t2 = feats.get("team2_red_wr")  if team1_side == "Blue" else feats.get("team2_blue_wr")
+    t1_pchamp = feats.get("team1_player_champ_wr", 0.5)
+    t2_pchamp = feats.get("team2_player_champ_wr", 0.5)
+    t1_cg     = feats.get("team1_champ_global_wr", 0.5)
+    t2_cg     = feats.get("team2_champ_global_wr", 0.5)
     return {
         "team1_games":     feats.get("team1_games", 0.0),
         "team1_winrate":   feats.get("team1_winrate", 0.0),
@@ -414,10 +581,129 @@ def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: di
         "team2_p_games":   0.0,
         "team2_p_winrate": feats.get("team2_player_wr_avg", 0.0),
         "team2_p_kda":     feats.get("team2_player_kda_avg", 0.0),
+        "team1_champ_global_wr": t1_cg,
+        "team2_champ_global_wr": t2_cg,
+        "team1_pchamp_wr":       t1_pchamp,
+        "team2_pchamp_wr":       t2_pchamp,
+        "champ_matchup_wr":      feats.get("champ_matchup_wr", 0.5),
         "wr_diff":         feats.get("wr_diff", 0.0),
         "p_wr_diff":       feats.get("pwr_diff", 0.0),
         "side_wr_diff":    (side_wr_t1 or 0.0) - (side_wr_t2 or 0.0),
+        "champ_global_diff": t1_cg - t2_cg,
+        "pchamp_diff":       t1_pchamp - t2_pchamp,
     }
+
+
+# Feature → group mapping for the prediction explanation. Anything in
+# `FEATURE_COLS` not listed here falls into "other" (currently empty).
+_FEATURE_GROUPS: dict[str, list[str]] = {
+    "team_form":         ["team1_winrate", "team2_winrate", "team1_games", "team2_games",
+                          "team1_avg_len", "team2_avg_len", "wr_diff"],
+    "player_form":       ["team1_p_winrate", "team2_p_winrate", "team1_p_games", "team2_p_games",
+                          "team1_p_kda", "team2_p_kda", "p_wr_diff"],
+    "champion_picks":    ["team1_champ_global_wr", "team2_champ_global_wr", "champ_global_diff"],
+    "player_on_champion":["team1_pchamp_wr", "team2_pchamp_wr", "pchamp_diff"],
+    "champion_matchup":  ["champ_matchup_wr"],
+    "head_to_head":      ["h2h_team1_wr", "h2h_games"],
+    "side":              ["team1_side_wr", "team2_side_wr", "team1_side_blue", "side_wr_diff"],
+}
+
+
+def _explain_prediction(model, cols: list[str], mfeats: dict, full_p: float) -> dict:
+    """Attribute the prediction to feature groups via "neutralization deltas".
+
+    For each group, recompute the probability with that group's features held
+    at the training mean (so they contribute zero to the standardized logit),
+    then report `full_p - neutral_p`. Positive = the group helped team1.
+
+    Logistic regression is non-linear in probability space (sigmoid), so the
+    deltas don't sum exactly to (full_p - 0.5). They sum approximately, which
+    is fine for explanation — the relative magnitudes are what matters.
+    """
+    scaler = model.named_steps["scaler"]
+    means = list(scaler.mean_)
+    col_to_idx = {c: i for i, c in enumerate(cols)}
+    base_x = [mfeats[c] for c in cols]
+
+    def proba(x_row):
+        return float(model.predict_proba([x_row])[0][1])
+
+    groups_out = []
+    for group, feature_names in _FEATURE_GROUPS.items():
+        x_neutral = list(base_x)
+        active = []
+        for fname in feature_names:
+            i = col_to_idx.get(fname)
+            if i is None:
+                continue
+            x_neutral[i] = means[i]  # hold at training mean -> zero standardized contribution
+            active.append(fname)
+        if not active:
+            continue
+        p_without = proba(x_neutral)
+        delta = full_p - p_without
+        groups_out.append({
+            "group": group,
+            "delta_team1_prob": round(delta, 4),  # +ve favors team1, -ve favors team2
+            "p_without_group":  round(p_without, 4),
+        })
+
+    # Sort by absolute impact, biggest first.
+    groups_out.sort(key=lambda r: -abs(r["delta_team1_prob"]))
+    return {"groups": groups_out}
+
+
+def _per_lane_advantage(team1_picks, team2_picks, feats) -> list[dict]:
+    """Per-role lane advantage based on the live feature lookups we already did.
+
+    For each role where both teams have a champion (and ideally a player) filled,
+    return who is favored using player-on-champion WR (when both samples exist),
+    falling back to champion-vs-champion matchup WR.
+    """
+    if not (team1_picks and team2_picks):
+        return []
+    by_role_t1 = {p.role: p for p in team1_picks if p.role and p.champion}
+    by_role_t2 = {p.role: p for p in team2_picks if p.role and p.champion}
+    out = []
+    with get_conn() as conn:
+        from backend.features.build import _player_champ, _champion_matchup, _champion_global
+        for role in ("Top", "Jungle", "Mid", "Bot", "Support"):
+            s1 = by_role_t1.get(role); s2 = by_role_t2.get(role)
+            if not (s1 and s2):
+                continue
+            cm = _champion_matchup(conn, s1.champion, s2.champion)
+            entry = {
+                "role":       role,
+                "team1_player":   s1.player or None,
+                "team1_champion": s1.champion,
+                "team2_player":   s2.player or None,
+                "team2_champion": s2.champion,
+                "matchup_games":   int(cm["games"]),
+                "matchup_team1_wr": round(cm["winrate"], 4) if cm["games"] else None,
+            }
+            # Prefer player-on-champion when both have meaningful samples.
+            if s1.player and s2.player:
+                pc1 = _player_champ(conn, s1.player, s1.champion)
+                pc2 = _player_champ(conn, s2.player, s2.champion)
+                if pc1["champ_games"] >= 2 and pc2["champ_games"] >= 2:
+                    entry["team1_player_champ_wr"] = round(pc1["champ_winrate"], 4)
+                    entry["team2_player_champ_wr"] = round(pc2["champ_winrate"], 4)
+                    entry["team1_player_champ_games"] = int(pc1["champ_games"])
+                    entry["team2_player_champ_games"] = int(pc2["champ_games"])
+                    entry["edge"] = round(pc1["champ_winrate"] - pc2["champ_winrate"], 4)
+                    entry["edge_basis"] = "player-on-champion"
+            if "edge" not in entry:
+                if cm["games"] >= 5:
+                    entry["edge"] = round(cm["winrate"] - 0.5, 4) * 2  # scale to [-1,1]
+                    entry["edge_basis"] = "champion-matchup"
+                else:
+                    # Fall back to champion-pool strength.
+                    cg1 = _champion_global(conn, s1.champion)
+                    cg2 = _champion_global(conn, s2.champion)
+                    entry["edge"] = round(cg1["winrate"] - cg2["winrate"], 4)
+                    entry["edge_basis"] = "champion-global"
+            out.append(entry)
+    return out
 
 
 @app.post("/predict")
@@ -442,6 +728,7 @@ def predict(req: PredictRequest):
     feats = build_features(inp)
 
     bundle = load_model()
+    explanation = None
     if bundle is not None:
         model = bundle["model"]
         cols  = bundle["feature_cols"]
@@ -449,9 +736,12 @@ def predict(req: PredictRequest):
         x = [[mfeats[c] for c in cols]]
         p = float(model.predict_proba(x)[0][1])
         which = "logreg-v1"
+        explanation = _explain_prediction(model, cols, mfeats, p)
     else:
         p = baseline_probability(feats)
         which = "heuristic-v0"
+
+    lanes = _per_lane_advantage(inp.team1_players, inp.team2_players, feats)
 
     return {
         "team1": req.team1,
@@ -460,4 +750,22 @@ def predict(req: PredictRequest):
         "team2_win_probability": round(1 - p, 4),
         "model": which,
         "features": {k: round(v, 4) for k, v in feats.items()},
+        "explanation": explanation,
+        "lane_advantages": lanes,
     }
+
+
+# Serve the static frontend when the directory is present alongside `backend/`.
+# This is purely additive — local `open frontend/index.html` still works because
+# that flow doesn't go through FastAPI at all. On Railway / any single-service
+# deploy this lets the same process serve both API and UI from the same origin,
+# so the frontend's `location.hostname` check resolves to "" and API calls go
+# to the same host.
+_FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
+if _FRONTEND_DIR.is_dir():
+    @app.get("/")
+    def _index():
+        return FileResponse(_FRONTEND_DIR / "index.html")
+
+    # Mount remaining static assets under /static so we never shadow API routes.
+    app.mount("/static", StaticFiles(directory=_FRONTEND_DIR), name="static")
