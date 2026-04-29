@@ -129,7 +129,12 @@ def train(val_fraction: float = 0.2, min_rows: int = 50) -> TrainResult:
         pva = [float(p[1]) for p in clf.predict_proba(Xva)]
         candidates.append((f"logreg-l2(C={C})", clf, _eval(yva, pva), pva))
 
-    for C in [0.03, 0.05, 0.1, 0.3, 1.0]:
+    # L1 (lasso) — feature selection. We cap C at 0.1 (don't go more aggressive)
+    # because below that L1 zeroes out 30+ of 35 features, leaving an
+    # uninterpretable model that gives "—" on every explanation row except the
+    # 2-3 surviving features. Empirically C=0.03 gains 0.6pp accuracy over
+    # C=0.1 but kills the explanation panel UX. Not worth it.
+    for C in [0.1, 0.3, 1.0]:
         clf = Pipeline([
             ("scaler", StandardScaler()),
             ("lr", LogisticRegression(max_iter=5000, C=C, penalty="l1", solver="liblinear")),
@@ -137,6 +142,22 @@ def train(val_fraction: float = 0.2, min_rows: int = 50) -> TrainResult:
         clf.fit(Xtr, ytr)
         pva = [float(p[1]) for p in clf.predict_proba(Xva)]
         candidates.append((f"logreg-l1(C={C})", clf, _eval(yva, pva), pva))
+
+    # ElasticNet (L1 + L2 mix) — keeps correlated feature groups together
+    # instead of L1's "winner-take-all". Useful for interpretability when
+    # multiple features carry the same signal.
+    for C in [0.1, 0.3, 1.0]:
+        for l1_ratio in [0.3, 0.5]:
+            clf = Pipeline([
+                ("scaler", StandardScaler()),
+                ("lr", LogisticRegression(
+                    max_iter=5000, C=C, penalty="elasticnet",
+                    solver="saga", l1_ratio=l1_ratio,
+                )),
+            ])
+            clf.fit(Xtr, ytr)
+            pva = [float(p[1]) for p in clf.predict_proba(Xva)]
+            candidates.append((f"logreg-en(C={C},l1={l1_ratio})", clf, _eval(yva, pva), pva))
 
     # Gradient boosting as a tabular sanity check.
     gb = GradientBoostingClassifier(
