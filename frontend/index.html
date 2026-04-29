@@ -135,19 +135,30 @@
     }
     .role.has-edge .lane-edge { display: flex; }
     .lane-edge .row {
-      display: grid; grid-template-columns: 50px 1fr 50px;
+      display: grid; grid-template-columns: 50px 46px 1fr 46px 60px;
       align-items: center; gap: 8px;
     }
     .lane-edge .row .kind {
       font-size: 10px; color: var(--muted); text-transform: uppercase;
       letter-spacing: 0.05em; font-weight: 600;
     }
+    .lane-edge .row .chip {
+      font-size: 11px; font-weight: 600; color: var(--text);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .lane-edge .row .chip small {
+      color: var(--muted); font-weight: 400; margin-left: 2px;
+    }
+    .lane-edge .row .chip.left  { text-align: right; }
+    .lane-edge .row .chip.right { text-align: left;  }
     .lane-edge .row .who {
       text-align: right; font-size: 10px; color: var(--muted);
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .lane-edge .row .who.t1 { color: var(--blue); }
     .lane-edge .row .who.t2 { color: var(--red); }
+    .lane-edge .row.empty .chip { color: var(--muted); }
     .lane-edge .meter {
       height: 4px; border-radius: 4px; overflow: visible;
       background: var(--bg2); position: relative; border: 1px solid var(--border);
@@ -748,12 +759,34 @@ function renderLaneEdges(lanes, t1, t2) {
   const maxPlayer  = Math.max(...lanes.map(l => Math.abs(l.player_edge  ?? 0)), 0.05);
   const maxMatchup = Math.max(...lanes.map(l => Math.abs(l.matchup_edge ?? 0)), 0.05);
 
-  const buildRow = (kind, edge, max) => {
+  const fmtPctMaybe = (x) => x == null ? "—" : `${(x * 100).toFixed(0)}%`;
+
+  // The percentage chips next to the bars are the "raw stat" each row is
+  // visualizing — so a viewer can verify what the bar means. Without them,
+  // a near-even bar with a team name is ambiguous (is it 51-49? 60-40?).
+  const buildRow = (kind, edge, max, lane) => {
+    let leftLabel = "—", rightLabel = "—";
+    let leftSub = "", rightSub = "";
+    if (kind === "Player") {
+      leftLabel  = fmtPctMaybe(lane.team1_player_champ_wr);
+      rightLabel = fmtPctMaybe(lane.team2_player_champ_wr);
+      leftSub    = lane.team1_player_champ_games ? `${lane.team1_player_champ_games}g` : "";
+      rightSub   = lane.team2_player_champ_games ? `${lane.team2_player_champ_games}g` : "";
+    } else if (kind === "Matchup") {
+      // matchup_team1_wr is team1-perspective; team2-perspective is its complement.
+      const m = lane.matchup_team1_wr;
+      leftLabel  = fmtPctMaybe(m);
+      rightLabel = fmtPctMaybe(m == null ? null : 1 - m);
+      leftSub    = lane.matchup_games ? `${lane.matchup_games}g` : "";
+      rightSub   = lane.matchup_games ? `${lane.matchup_games}g` : "";
+    }
     if (edge == null) {
       return `
         <div class="row empty">
           <span class="kind">${kind}</span>
+          <span class="chip left">${leftLabel}${leftSub ? ` <small>${leftSub}</small>` : ""}</span>
           <div class="meter"><div class="center"></div></div>
+          <span class="chip right">${rightLabel}${rightSub ? ` <small>${rightSub}</small>` : ""}</span>
           <span class="who">no data</span>
         </div>
       `;
@@ -767,18 +800,20 @@ function renderLaneEdges(lanes, t1, t2) {
     return `
       <div class="row">
         <span class="kind">${kind}</span>
+        <span class="chip left">${leftLabel}${leftSub ? ` <small>${leftSub}</small>` : ""}</span>
         <div class="meter">
           <div class="center"></div>
           ${fill}
         </div>
+        <span class="chip right">${rightLabel}${rightSub ? ` <small>${rightSub}</small>` : ""}</span>
         <span class="who ${cls}">${favored}</span>
       </div>
     `;
   };
 
   for (const lane of lanes) {
-    const html = buildRow("Player", lane.player_edge, maxPlayer)
-               + buildRow("Matchup", lane.matchup_edge, maxMatchup);
+    const html = buildRow("Player",  lane.player_edge,  maxPlayer,  lane)
+               + buildRow("Matchup", lane.matchup_edge, maxMatchup, lane);
     for (const hostId of ["t1roles", "t2roles"]) {
       const row = document.querySelector(`#${hostId} [data-role-row="${lane.role}"]`);
       if (!row) continue;
