@@ -2,11 +2,14 @@
 
 Single source of truth for league scope, patch window, and paths.
 """
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
+# Allow override via env var so deploys can point at a mounted volume
+# (Railway/Fly/etc.) without changing code. Defaults to ./data for local use.
+DATA_DIR = Path(os.environ.get("LOL_DATA_DIR") or (PROJECT_ROOT / "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "lol_betting.db"
 

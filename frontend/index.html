@@ -109,6 +109,24 @@
       background: var(--bg2); border: 1px solid var(--border);
       border-radius: 10px; padding: 8px 10px;
     }
+    .role .role-stats {
+      grid-column: 1 / -1;
+      display: flex; flex-wrap: wrap; gap: 6px 12px;
+      font-size: 11px; color: var(--muted);
+      padding-top: 4px; border-top: 1px dashed var(--border);
+      margin-top: 2px;
+    }
+    .role .role-stats .chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      background: rgba(255,255,255,0.02); padding: 2px 8px;
+      border-radius: 999px; border: 1px solid var(--border);
+    }
+    .role .role-stats .chip b { color: var(--text); font-weight: 600; }
+    .role .role-stats .chip.good b { color: var(--good); }
+    .role .role-stats .chip.bad  b { color: var(--bad); }
+    .role .role-stats .chip.warn b { color: #e3b341; }
+    .role .role-stats .chip.tiny { font-size: 10.5px; }
+    .role.has-stats { padding-bottom: 6px; }
     .role .role-tag {
       font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
       display: flex; align-items: center; gap: 6px;
@@ -317,17 +335,116 @@ function renderRoleInputs(host) {
         <div class="champ-icon" data-icon-for="${r}"></div>
         <input data-role="${r}" data-kind="champ" placeholder="Champion" list="champList" autocomplete="off" />
       </div>
+      <div class="role-stats" data-stats-for="${r}" hidden></div>
     </div>
   `).join("");
-  // Update icon when champion field changes
+
+  const debounceTimers = {};
+  const refreshStats = (role) => {
+    clearTimeout(debounceTimers[role]);
+    debounceTimers[role] = setTimeout(() => {
+      // Champion change on either side affects the matchup chip on both sides.
+      loadRoleStats(host, role);
+      const other = host.id === "t1roles" ? document.getElementById("t2roles") : document.getElementById("t1roles");
+      // Only refresh the other side if its champion is filled (avoids spurious fetches).
+      const otherChamp = other.querySelector(`[data-role="${role}"][data-kind="champ"]`).value.trim();
+      if (otherChamp) loadRoleStats(other, role);
+    }, 220);
+  };
+
   host.querySelectorAll('input[data-kind="champ"]').forEach(el => {
     el.addEventListener("input", () => {
       const role = el.dataset.role;
       const icon = host.querySelector(`[data-icon-for="${role}"]`);
       const c = CHAMP_INDEX[el.value.trim()];
       icon.style.backgroundImage = c ? `url(${c.icon_url})` : "";
+      refreshStats(role);
     });
   });
+  host.querySelectorAll('input[data-kind="player"]').forEach(el => {
+    el.addEventListener("input", () => refreshStats(el.dataset.role));
+  });
+}
+
+function wrChip(label, wr, games, opts = {}) {
+  if (wr == null || !games) {
+    return `<span class="chip tiny"><span class="muted">${label}</span> <b>—</b></span>`;
+  }
+  const pct = (wr * 100).toFixed(0);
+  let cls = "";
+  if (opts.colorize) cls = wr >= 0.55 ? "good" : (wr <= 0.45 ? "bad" : (games < 3 ? "warn" : ""));
+  return `<span class="chip ${cls}"><span class="muted">${label}</span> <b>${pct}%</b> <span class="muted">(${games}g)</span></span>`;
+}
+
+async function loadRoleStats(host, role) {
+  const row = host.querySelector(`[data-role-row="${role}"]`);
+  const out = host.querySelector(`[data-stats-for="${role}"]`);
+  const player = row.querySelector(`[data-kind="player"]`).value.trim();
+  const champ  = row.querySelector(`[data-kind="champ"]`).value.trim();
+  if (!champ) {
+    out.hidden = true; out.innerHTML = "";
+    row.classList.remove("has-stats");
+    refreshMatchupChips(role);
+    return;
+  }
+  const url = new URL(API + "/champion-stats");
+  url.searchParams.set("champion", champ);
+  if (player) url.searchParams.set("player", player);
+  url.searchParams.set("role", role);
+  try {
+    const r = await fetch(url);
+    if (!r.ok) { out.hidden = true; row.classList.remove("has-stats"); return; }
+    const j = await r.json();
+    const parts = [];
+    parts.push(wrChip(`${champ} global`, j.global?.winrate, j.global?.games || 0, { colorize: true }));
+    if (player) {
+      parts.push(wrChip(`${player} on ${champ}`, j.player_on_champion?.winrate, j.player_on_champion?.games || 0, { colorize: true }));
+      parts.push(wrChip(`${player} ${role}`, j.player_overall?.winrate, j.player_overall?.games || 0, { colorize: true }));
+    }
+    out.innerHTML = parts.join("");
+    out.hidden = false;
+    row.classList.add("has-stats");
+  } catch (_) {
+    out.hidden = true; row.classList.remove("has-stats");
+  }
+  refreshMatchupChips(role);
+}
+
+// Champion-vs-champion matchup chip is rendered into a single shared row at
+// the bottom of each team's role stats — but conceptually it's a "row pair"
+// metric. We attach it to whichever role-stats panel is on team1 (the blue side).
+async function refreshMatchupChips(role) {
+  const t1Host = document.getElementById("t1roles");
+  const t2Host = document.getElementById("t2roles");
+  const c1 = t1Host.querySelector(`[data-role="${role}"][data-kind="champ"]`).value.trim();
+  const c2 = t2Host.querySelector(`[data-role="${role}"][data-kind="champ"]`).value.trim();
+  // Render matchup chip into both role-stats panels so each side sees their own perspective.
+  for (const side of ["team1", "team2"]) {
+    const host = side === "team1" ? t1Host : t2Host;
+    const row = host.querySelector(`[data-role-row="${role}"]`);
+    const out = host.querySelector(`[data-stats-for="${role}"]`);
+    // Strip any stale matchup chip first.
+    out.querySelectorAll('[data-matchup-chip]').forEach(el => el.remove());
+    if (!c1 || !c2 || c1 === c2) continue;
+    const me = side === "team1" ? c1 : c2;
+    const them = side === "team1" ? c2 : c1;
+    try {
+      const r = await fetch(API + `/champion-matchup?champion1=${encodeURIComponent(me)}&champion2=${encodeURIComponent(them)}&role=${encodeURIComponent(role)}`);
+      if (!r.ok) continue;
+      const j = await r.json();
+      const wr = j.winrate;
+      const g  = j.games || 0;
+      const pct = wr == null ? "—" : (wr * 100).toFixed(0) + "%";
+      const cls = wr == null ? "" : (wr >= 0.55 ? "good" : (wr <= 0.45 ? "bad" : (g < 5 ? "warn" : "")));
+      const chip = document.createElement("span");
+      chip.className = `chip ${cls}`;
+      chip.dataset.matchupChip = "1";
+      chip.innerHTML = `<span class="muted">vs ${them}</span> <b>${pct}</b> <span class="muted">(${g}g)</span>`;
+      out.appendChild(chip);
+      out.hidden = false;
+      row.classList.add("has-stats");
+    } catch (_) {}
+  }
 }
 renderRoleInputs(document.getElementById("t1roles"));
 renderRoleInputs(document.getElementById("t2roles"));
@@ -350,7 +467,10 @@ async function autoFillLineup(host, team) {
     const j = await r.json();
     j.lineup.forEach(p => {
       const el = host.querySelector(`[data-role="${p.role}"][data-kind="player"]`);
-      if (el && !el.value.trim()) el.value = p.player;
+      if (el && !el.value.trim()) {
+        el.value = p.player;
+        el.dispatchEvent(new Event("input"));
+      }
     });
   } catch (_) {}
 }
