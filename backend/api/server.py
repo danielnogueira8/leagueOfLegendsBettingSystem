@@ -594,6 +594,118 @@ def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: di
     }
 
 
+# Feature → group mapping for the prediction explanation. Anything in
+# `FEATURE_COLS` not listed here falls into "other" (currently empty).
+_FEATURE_GROUPS: dict[str, list[str]] = {
+    "team_form":         ["team1_winrate", "team2_winrate", "team1_games", "team2_games",
+                          "team1_avg_len", "team2_avg_len", "wr_diff"],
+    "player_form":       ["team1_p_winrate", "team2_p_winrate", "team1_p_games", "team2_p_games",
+                          "team1_p_kda", "team2_p_kda", "p_wr_diff"],
+    "champion_picks":    ["team1_champ_global_wr", "team2_champ_global_wr", "champ_global_diff"],
+    "player_on_champion":["team1_pchamp_wr", "team2_pchamp_wr", "pchamp_diff"],
+    "champion_matchup":  ["champ_matchup_wr"],
+    "head_to_head":      ["h2h_team1_wr", "h2h_games"],
+    "side":              ["team1_side_wr", "team2_side_wr", "team1_side_blue", "side_wr_diff"],
+}
+
+
+def _explain_prediction(model, cols: list[str], mfeats: dict, full_p: float) -> dict:
+    """Attribute the prediction to feature groups via "neutralization deltas".
+
+    For each group, recompute the probability with that group's features held
+    at the training mean (so they contribute zero to the standardized logit),
+    then report `full_p - neutral_p`. Positive = the group helped team1.
+
+    Logistic regression is non-linear in probability space (sigmoid), so the
+    deltas don't sum exactly to (full_p - 0.5). They sum approximately, which
+    is fine for explanation — the relative magnitudes are what matters.
+    """
+    scaler = model.named_steps["scaler"]
+    means = list(scaler.mean_)
+    col_to_idx = {c: i for i, c in enumerate(cols)}
+    base_x = [mfeats[c] for c in cols]
+
+    def proba(x_row):
+        return float(model.predict_proba([x_row])[0][1])
+
+    groups_out = []
+    for group, feature_names in _FEATURE_GROUPS.items():
+        x_neutral = list(base_x)
+        active = []
+        for fname in feature_names:
+            i = col_to_idx.get(fname)
+            if i is None:
+                continue
+            x_neutral[i] = means[i]  # hold at training mean -> zero standardized contribution
+            active.append(fname)
+        if not active:
+            continue
+        p_without = proba(x_neutral)
+        delta = full_p - p_without
+        groups_out.append({
+            "group": group,
+            "delta_team1_prob": round(delta, 4),  # +ve favors team1, -ve favors team2
+            "p_without_group":  round(p_without, 4),
+        })
+
+    # Sort by absolute impact, biggest first.
+    groups_out.sort(key=lambda r: -abs(r["delta_team1_prob"]))
+    return {"groups": groups_out}
+
+
+def _per_lane_advantage(team1_picks, team2_picks, feats) -> list[dict]:
+    """Per-role lane advantage based on the live feature lookups we already did.
+
+    For each role where both teams have a champion (and ideally a player) filled,
+    return who is favored using player-on-champion WR (when both samples exist),
+    falling back to champion-vs-champion matchup WR.
+    """
+    if not (team1_picks and team2_picks):
+        return []
+    by_role_t1 = {p.role: p for p in team1_picks if p.role and p.champion}
+    by_role_t2 = {p.role: p for p in team2_picks if p.role and p.champion}
+    out = []
+    with get_conn() as conn:
+        from backend.features.build import _player_champ, _champion_matchup, _champion_global
+        for role in ("Top", "Jungle", "Mid", "Bot", "Support"):
+            s1 = by_role_t1.get(role); s2 = by_role_t2.get(role)
+            if not (s1 and s2):
+                continue
+            cm = _champion_matchup(conn, s1.champion, s2.champion)
+            entry = {
+                "role":       role,
+                "team1_player":   s1.player or None,
+                "team1_champion": s1.champion,
+                "team2_player":   s2.player or None,
+                "team2_champion": s2.champion,
+                "matchup_games":   int(cm["games"]),
+                "matchup_team1_wr": round(cm["winrate"], 4) if cm["games"] else None,
+            }
+            # Prefer player-on-champion when both have meaningful samples.
+            if s1.player and s2.player:
+                pc1 = _player_champ(conn, s1.player, s1.champion)
+                pc2 = _player_champ(conn, s2.player, s2.champion)
+                if pc1["champ_games"] >= 2 and pc2["champ_games"] >= 2:
+                    entry["team1_player_champ_wr"] = round(pc1["champ_winrate"], 4)
+                    entry["team2_player_champ_wr"] = round(pc2["champ_winrate"], 4)
+                    entry["team1_player_champ_games"] = int(pc1["champ_games"])
+                    entry["team2_player_champ_games"] = int(pc2["champ_games"])
+                    entry["edge"] = round(pc1["champ_winrate"] - pc2["champ_winrate"], 4)
+                    entry["edge_basis"] = "player-on-champion"
+            if "edge" not in entry:
+                if cm["games"] >= 5:
+                    entry["edge"] = round(cm["winrate"] - 0.5, 4) * 2  # scale to [-1,1]
+                    entry["edge_basis"] = "champion-matchup"
+                else:
+                    # Fall back to champion-pool strength.
+                    cg1 = _champion_global(conn, s1.champion)
+                    cg2 = _champion_global(conn, s2.champion)
+                    entry["edge"] = round(cg1["winrate"] - cg2["winrate"], 4)
+                    entry["edge_basis"] = "champion-global"
+            out.append(entry)
+    return out
+
+
 @app.post("/predict")
 def predict(req: PredictRequest):
     with get_conn() as conn:
@@ -616,6 +728,7 @@ def predict(req: PredictRequest):
     feats = build_features(inp)
 
     bundle = load_model()
+    explanation = None
     if bundle is not None:
         model = bundle["model"]
         cols  = bundle["feature_cols"]
@@ -623,9 +736,12 @@ def predict(req: PredictRequest):
         x = [[mfeats[c] for c in cols]]
         p = float(model.predict_proba(x)[0][1])
         which = "logreg-v1"
+        explanation = _explain_prediction(model, cols, mfeats, p)
     else:
         p = baseline_probability(feats)
         which = "heuristic-v0"
+
+    lanes = _per_lane_advantage(inp.team1_players, inp.team2_players, feats)
 
     return {
         "team1": req.team1,
@@ -634,6 +750,8 @@ def predict(req: PredictRequest):
         "team2_win_probability": round(1 - p, 4),
         "model": which,
         "features": {k: round(v, 4) for k, v in feats.items()},
+        "explanation": explanation,
+        "lane_advantages": lanes,
     }
 
 

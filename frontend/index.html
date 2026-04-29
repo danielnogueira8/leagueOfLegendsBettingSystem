@@ -127,6 +127,51 @@
     .role .role-stats .chip.warn b { color: #e3b341; }
     .role .role-stats .chip.tiny { font-size: 10.5px; }
     .role.has-stats { padding-bottom: 6px; }
+    .role .lane-edge {
+      grid-column: 1 / -1;
+      display: none; align-items: center; gap: 6px;
+      font-size: 11px; color: var(--muted);
+      padding-top: 4px;
+    }
+    .role.has-edge .lane-edge { display: flex; }
+    .lane-edge .arrow { font-weight: 800; font-size: 13px; }
+    .lane-edge .arrow.left  { color: var(--blue); }
+    .lane-edge .arrow.right { color: var(--red); }
+    .lane-edge .meter {
+      flex: 1; height: 4px; border-radius: 4px; overflow: hidden;
+      background: var(--bg2); position: relative; border: 1px solid var(--border);
+    }
+    .lane-edge .meter .fill {
+      position: absolute; top: 0; bottom: 0;
+      transition: all 250ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .lane-edge .meter .fill.t1 { background: linear-gradient(90deg, var(--blue-deep), var(--blue)); right: 50%; }
+    .lane-edge .meter .fill.t2 { background: linear-gradient(90deg, var(--red), var(--red-deep)); left: 50%; }
+
+    .why-card { margin-top: 14px; }
+    .why-row {
+      display: grid; grid-template-columns: 130px 1fr 60px;
+      gap: 10px; align-items: center;
+      padding: 6px 0;
+      font-size: 12px;
+    }
+    .why-row .label { color: var(--muted-strong); font-weight: 500; text-transform: capitalize; }
+    .why-row .delta { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .why-row .delta.pos { color: var(--blue); }
+    .why-row .delta.neg { color: var(--red); }
+    .why-row .delta.zero { color: var(--muted); }
+    .why-row .meter {
+      height: 8px; background: var(--bg2); border-radius: 4px; position: relative; overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .why-row .meter .center { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--border-hi); }
+    .why-row .meter .bar {
+      position: absolute; top: 0; bottom: 0;
+      transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .why-row .meter .bar.pos { background: linear-gradient(90deg, var(--blue-deep), var(--blue)); left: 50%; }
+    .why-row .meter .bar.neg { background: linear-gradient(90deg, var(--red), var(--red-deep)); right: 50%; }
+    .why-empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
     .role .role-tag {
       font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
       display: flex; align-items: center; gap: 6px;
@@ -287,6 +332,11 @@
         <div class="red"  id="bar2"></div>
       </div>
 
+      <div class="why-card">
+        <h3>Why this prediction</h3>
+        <div id="whyBody"></div>
+      </div>
+
       <div class="grid-2" style="margin-top:18px">
         <div>
           <h3>Head-to-head</h3>
@@ -336,6 +386,7 @@ function renderRoleInputs(host) {
         <input data-role="${r}" data-kind="champ" placeholder="Champion" list="champList" autocomplete="off" />
       </div>
       <div class="role-stats" data-stats-for="${r}" hidden></div>
+      <div class="lane-edge" data-edge-for="${r}"></div>
     </div>
   `).join("");
 
@@ -384,66 +435,50 @@ async function loadRoleStats(host, role) {
   if (!champ) {
     out.hidden = true; out.innerHTML = "";
     row.classList.remove("has-stats");
-    refreshMatchupChips(role);
     return;
   }
-  const url = new URL(API + "/champion-stats");
-  url.searchParams.set("champion", champ);
-  if (player) url.searchParams.set("player", player);
-  url.searchParams.set("role", role);
-  try {
-    const r = await fetch(url);
-    if (!r.ok) { out.hidden = true; row.classList.remove("has-stats"); return; }
-    const j = await r.json();
-    const parts = [];
-    parts.push(wrChip(`${champ} global`, j.global?.winrate, j.global?.games || 0, { colorize: true }));
+  // Compute the opposing team's champion at the same role for the matchup chip.
+  const otherHost = host.id === "t1roles" ? document.getElementById("t2roles") : document.getElementById("t1roles");
+  const oppChamp = otherHost.querySelector(`[data-role="${role}"][data-kind="champ"]`).value.trim();
+
+  // Fire stats + matchup in parallel, then render once atomically (no append
+  // race that can produce duplicate chips).
+  const statsUrl = new URL(API + "/champion-stats");
+  statsUrl.searchParams.set("champion", champ);
+  if (player) statsUrl.searchParams.set("player", player);
+  statsUrl.searchParams.set("role", role);
+
+  const fetches = [fetch(statsUrl).then(r => r.ok ? r.json() : null).catch(() => null)];
+  if (oppChamp && oppChamp !== champ) {
+    fetches.push(fetch(API + `/champion-matchup?champion1=${encodeURIComponent(champ)}&champion2=${encodeURIComponent(oppChamp)}&role=${encodeURIComponent(role)}`)
+      .then(r => r.ok ? r.json() : null).catch(() => null));
+  } else {
+    fetches.push(Promise.resolve(null));
+  }
+  const [stats, matchup] = await Promise.all(fetches);
+
+  const parts = [];
+  if (stats) {
+    parts.push(wrChip(`${champ} global`, stats.global?.winrate, stats.global?.games || 0, { colorize: true }));
     if (player) {
-      parts.push(wrChip(`${player} on ${champ}`, j.player_on_champion?.winrate, j.player_on_champion?.games || 0, { colorize: true }));
-      parts.push(wrChip(`${player} ${role}`, j.player_overall?.winrate, j.player_overall?.games || 0, { colorize: true }));
+      parts.push(wrChip(`${player} on ${champ}`, stats.player_on_champion?.winrate, stats.player_on_champion?.games || 0, { colorize: true }));
     }
+  }
+  if (matchup) {
+    const wr = matchup.winrate;
+    const g  = matchup.games || 0;
+    const pct = wr == null ? "—" : (wr * 100).toFixed(0) + "%";
+    const cls = wr == null ? "" : (wr >= 0.55 ? "good" : (wr <= 0.45 ? "bad" : (g < 5 ? "warn" : "")));
+    parts.push(`<span class="chip ${cls}"><span class="muted">vs ${oppChamp}</span> <b>${pct}</b> <span class="muted">(${g}g)</span>`);
+  }
+
+  if (parts.length) {
     out.innerHTML = parts.join("");
     out.hidden = false;
     row.classList.add("has-stats");
-  } catch (_) {
-    out.hidden = true; row.classList.remove("has-stats");
-  }
-  refreshMatchupChips(role);
-}
-
-// Champion-vs-champion matchup chip is rendered into a single shared row at
-// the bottom of each team's role stats — but conceptually it's a "row pair"
-// metric. We attach it to whichever role-stats panel is on team1 (the blue side).
-async function refreshMatchupChips(role) {
-  const t1Host = document.getElementById("t1roles");
-  const t2Host = document.getElementById("t2roles");
-  const c1 = t1Host.querySelector(`[data-role="${role}"][data-kind="champ"]`).value.trim();
-  const c2 = t2Host.querySelector(`[data-role="${role}"][data-kind="champ"]`).value.trim();
-  // Render matchup chip into both role-stats panels so each side sees their own perspective.
-  for (const side of ["team1", "team2"]) {
-    const host = side === "team1" ? t1Host : t2Host;
-    const row = host.querySelector(`[data-role-row="${role}"]`);
-    const out = host.querySelector(`[data-stats-for="${role}"]`);
-    // Strip any stale matchup chip first.
-    out.querySelectorAll('[data-matchup-chip]').forEach(el => el.remove());
-    if (!c1 || !c2 || c1 === c2) continue;
-    const me = side === "team1" ? c1 : c2;
-    const them = side === "team1" ? c2 : c1;
-    try {
-      const r = await fetch(API + `/champion-matchup?champion1=${encodeURIComponent(me)}&champion2=${encodeURIComponent(them)}&role=${encodeURIComponent(role)}`);
-      if (!r.ok) continue;
-      const j = await r.json();
-      const wr = j.winrate;
-      const g  = j.games || 0;
-      const pct = wr == null ? "—" : (wr * 100).toFixed(0) + "%";
-      const cls = wr == null ? "" : (wr >= 0.55 ? "good" : (wr <= 0.45 ? "bad" : (g < 5 ? "warn" : "")));
-      const chip = document.createElement("span");
-      chip.className = `chip ${cls}`;
-      chip.dataset.matchupChip = "1";
-      chip.innerHTML = `<span class="muted">vs ${them}</span> <b>${pct}</b> <span class="muted">(${g}g)</span>`;
-      out.appendChild(chip);
-      out.hidden = false;
-      row.classList.add("has-stats");
-    } catch (_) {}
+  } else {
+    out.hidden = true; out.innerHTML = "";
+    row.classList.remove("has-stats");
   }
 }
 renderRoleInputs(document.getElementById("t1roles"));
@@ -578,6 +613,85 @@ async function init() {
 }
 init();
 
+const GROUP_LABELS = {
+  team_form:           "Team form",
+  player_form:         "Player form",
+  champion_picks:      "Champion picks",
+  player_on_champion:  "Player on champion",
+  champion_matchup:    "Lane matchups",
+  head_to_head:        "Head-to-head",
+  side:                "Side (blue/red)",
+};
+
+function renderWhyPanel(explanation, t1, t2) {
+  const host = document.getElementById("whyBody");
+  if (!explanation || !explanation.groups || !explanation.groups.length) {
+    host.innerHTML = `<div class="why-empty">No explanation available (heuristic model).</div>`;
+    return;
+  }
+  // Scale meter widths so the largest delta fills ~half the bar.
+  const maxAbs = Math.max(...explanation.groups.map(g => Math.abs(g.delta_team1_prob)), 0.01);
+  host.innerHTML = explanation.groups.map(g => {
+    const d = g.delta_team1_prob;
+    const pct = (d * 100).toFixed(1);
+    const sign = d > 0 ? "+" : (d < 0 ? "" : "");
+    const cls = d > 0.001 ? "pos" : (d < -0.001 ? "neg" : "zero");
+    const widthPct = Math.min(50, (Math.abs(d) / maxAbs) * 50);
+    const barSide = d >= 0 ? "pos" : "neg";
+    const favored = d > 0.001 ? t1 : (d < -0.001 ? t2 : "neutral");
+    return `
+      <div class="why-row" title="Removing this group changes T1's probability by ${sign}${pct}% (favors ${favored})">
+        <div class="label">${GROUP_LABELS[g.group] || g.group}</div>
+        <div class="meter">
+          <div class="center"></div>
+          <div class="bar ${barSide}" style="width:${widthPct}%"></div>
+        </div>
+        <div class="delta ${cls}">${sign}${pct}%</div>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderLaneEdges(lanes, t1, t2) {
+  // Clear all first.
+  document.querySelectorAll(".role").forEach(row => {
+    row.classList.remove("has-edge");
+    const edge = row.querySelector(".lane-edge");
+    if (edge) edge.innerHTML = "";
+  });
+  if (!lanes.length) return;
+  const maxEdge = Math.max(...lanes.map(l => Math.abs(l.edge || 0)), 0.05);
+
+  for (const lane of lanes) {
+    const edge = lane.edge || 0;
+    // Render in BOTH team panes so the chip is visible on either side.
+    for (const hostId of ["t1roles", "t2roles"]) {
+      const row = document.querySelector(`#${hostId} [data-role-row="${lane.role}"]`);
+      if (!row) continue;
+      const target = row.querySelector(".lane-edge");
+      // Edge in [-1,1] (player-on-champion) or smaller for matchup-based.
+      const widthPct = Math.min(50, (Math.abs(edge) / maxEdge) * 50);
+      const arrowSide = edge > 0.005 ? "left" : (edge < -0.005 ? "right" : "");
+      const arrow = arrowSide === "left" ? "◄" : (arrowSide === "right" ? "►" : "·");
+      const favored = edge > 0.005 ? t1 : (edge < -0.005 ? t2 : "even");
+      const basisLabel = {
+        "player-on-champion": "player",
+        "champion-matchup":   "matchup",
+        "champion-global":    "champ",
+      }[lane.edge_basis] || "—";
+      target.innerHTML = `
+        <span class="arrow ${arrowSide}">${arrow}</span>
+        <span>${favored}</span>
+        <div class="meter">
+          <div class="fill ${edge >= 0 ? 't1' : 't2'}" style="width:${widthPct}%"></div>
+        </div>
+        <span class="muted">${basisLabel}</span>
+      `;
+      row.classList.add("has-edge");
+    }
+  }
+}
+
 document.getElementById("predictBtn").addEventListener("click", async () => {
   const t1 = document.getElementById("team1").value.trim();
   const t2 = document.getElementById("team2").value.trim();
@@ -626,6 +740,9 @@ document.getElementById("predictBtn").addEventListener("click", async () => {
     document.getElementById("bar2").textContent = p2 >= 14 ? p2.toFixed(0) + "%" : "";
     document.getElementById("modelTag").textContent = j.model;
     document.getElementById("featDump").textContent = JSON.stringify(j.features, null, 2);
+
+    renderWhyPanel(j.explanation, j.team1, j.team2);
+    renderLaneEdges(j.lane_advantages || [], j.team1, j.team2);
 
     document.getElementById("h2hSummary").innerHTML = h.games > 0
       ? `<strong>${h.team1_wins}-${h.team2_wins}</strong> in last ${h.games} games`
