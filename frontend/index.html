@@ -149,29 +149,59 @@
     .lane-edge .meter .fill.t2 { background: linear-gradient(90deg, var(--red), var(--red-deep)); left: 50%; }
 
     .why-card { margin-top: 14px; }
+    .why-header {
+      display: grid; grid-template-columns: 140px 1fr 1fr;
+      gap: 10px; padding: 0 0 8px; font-size: 11px;
+      color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+      border-bottom: 1px solid var(--border); margin-bottom: 4px;
+    }
+    .why-header .t1-name { text-align: right; color: var(--blue); font-weight: 700; }
+    .why-header .t2-name { text-align: left;  color: var(--red);  font-weight: 700; }
+
     .why-row {
-      display: grid; grid-template-columns: 130px 1fr 60px;
-      gap: 10px; align-items: center;
-      padding: 6px 0;
-      font-size: 12px;
+      display: grid; grid-template-columns: 140px 1fr 1fr;
+      gap: 0; align-items: center;
+      padding: 7px 0; font-size: 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
     }
-    .why-row .label { color: var(--muted-strong); font-weight: 500; text-transform: capitalize; }
-    .why-row .delta { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
-    .why-row .delta.pos { color: var(--blue); }
-    .why-row .delta.neg { color: var(--red); }
-    .why-row .delta.zero { color: var(--muted); }
-    .why-row .meter {
-      height: 8px; background: var(--bg2); border-radius: 4px; position: relative; overflow: hidden;
-      border: 1px solid var(--border);
+    .why-row:last-child { border-bottom: none; }
+    .why-row .label { color: var(--muted-strong); font-weight: 500; padding-right: 12px; }
+    .why-row .half {
+      position: relative; height: 14px;
+      display: flex; align-items: center;
     }
-    .why-row .meter .center { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--border-hi); }
-    .why-row .meter .bar {
-      position: absolute; top: 0; bottom: 0;
-      transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
+    .why-row .half.left  { justify-content: flex-end; padding-right: 6px; }
+    .why-row .half.right { justify-content: flex-start; padding-left: 6px; }
+    .why-row .half .track {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      height: 8px; background: var(--bg2); border: 1px solid var(--border);
     }
-    .why-row .meter .bar.pos { background: linear-gradient(90deg, var(--blue-deep), var(--blue)); left: 50%; }
-    .why-row .meter .bar.neg { background: linear-gradient(90deg, var(--red), var(--red-deep)); right: 50%; }
+    .why-row .half.left  .track { right: 0; left: 0;  border-radius: 4px 0 0 4px; }
+    .why-row .half.right .track { left: 0;  right: 0; border-radius: 0 4px 4px 0; }
+    .why-row .half .fill {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      height: 8px;
+      transition: width 350ms cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .why-row .half.left  .fill { right: 0; background: linear-gradient(270deg, var(--blue), var(--blue-deep)); border-radius: 4px 0 0 4px; }
+    .why-row .half.right .fill { left: 0;  background: linear-gradient(90deg,  var(--red),  var(--red-deep));  border-radius: 0 4px 4px 0; }
+    .why-row .half .pct {
+      position: relative; z-index: 1;
+      font-weight: 700; font-variant-numeric: tabular-nums; font-size: 11px;
+      color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+      padding: 0 6px;
+    }
+    .why-row .half .pct.muted { color: var(--muted); text-shadow: none; }
     .why-empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
+
+    .league-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--card-hi); border: 1px solid var(--border);
+      color: var(--muted-strong); font-size: 11px; font-weight: 600;
+      padding: 3px 10px; border-radius: 999px;
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .league-pill .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
     .role .role-tag {
       font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
       display: flex; align-items: center; gap: 6px;
@@ -321,7 +351,10 @@
     </div>
 
     <div class="card" id="resultCard" style="display:none">
-      <h2>Prediction</h2>
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;">
+        <h2 style="margin:0">Prediction</h2>
+        <span id="leaguePill"></span>
+      </div>
       <div class="result-row">
         <div class="name" id="rt1"></div>
         <div class="vs-tag" id="modelTag">model</div>
@@ -629,27 +662,49 @@ function renderWhyPanel(explanation, t1, t2) {
     host.innerHTML = `<div class="why-empty">No explanation available (heuristic model).</div>`;
     return;
   }
-  // Scale meter widths so the largest delta fills ~half the bar.
+  // Scale fill widths so the largest delta fills the full half-track.
   const maxAbs = Math.max(...explanation.groups.map(g => Math.abs(g.delta_team1_prob)), 0.01);
-  host.innerHTML = explanation.groups.map(g => {
-    const d = g.delta_team1_prob;
-    const pct = (d * 100).toFixed(1);
-    const sign = d > 0 ? "+" : (d < 0 ? "" : "");
-    const cls = d > 0.001 ? "pos" : (d < -0.001 ? "neg" : "zero");
-    const widthPct = Math.min(50, (Math.abs(d) / maxAbs) * 50);
-    const barSide = d >= 0 ? "pos" : "neg";
-    const favored = d > 0.001 ? t1 : (d < -0.001 ? t2 : "neutral");
+
+  const header = `
+    <div class="why-header">
+      <div></div>
+      <div class="t1-name">${t1}</div>
+      <div class="t2-name">${t2}</div>
+    </div>
+  `;
+
+  const rows = explanation.groups.map(g => {
+    const d = g.delta_team1_prob;            // +ve favors team1, -ve favors team2
+    const pct = Math.abs(d * 100).toFixed(1);
+    const widthPct = (Math.abs(d) / maxAbs) * 100;  // 0–100% of the half-track
+    const favorsT1 = d > 0.0005;
+    const favorsT2 = d < -0.0005;
+    const tooltip = favorsT1 ? `Favors ${t1} by ${pct}%`
+                  : favorsT2 ? `Favors ${t2} by ${pct}%`
+                  : "Neutral";
+    const t1Cell = favorsT1
+      ? `<div class="half left"><div class="track"></div><div class="fill" style="width:${widthPct}%"></div><span class="pct">+${pct}%</span></div>`
+      : `<div class="half left"><div class="track"></div><span class="pct muted">${favorsT2 ? "" : "—"}</span></div>`;
+    const t2Cell = favorsT2
+      ? `<div class="half right"><div class="track"></div><div class="fill" style="width:${widthPct}%"></div><span class="pct">+${pct}%</span></div>`
+      : `<div class="half right"><div class="track"></div><span class="pct muted">${favorsT1 ? "" : "—"}</span></div>`;
     return `
-      <div class="why-row" title="Removing this group changes T1's probability by ${sign}${pct}% (favors ${favored})">
+      <div class="why-row" title="${tooltip}">
         <div class="label">${GROUP_LABELS[g.group] || g.group}</div>
-        <div class="meter">
-          <div class="center"></div>
-          <div class="bar ${barSide}" style="width:${widthPct}%"></div>
-        </div>
-        <div class="delta ${cls}">${sign}${pct}%</div>
+        ${t1Cell}
+        ${t2Cell}
       </div>
     `;
   }).join("");
+
+  host.innerHTML = header + rows;
+}
+
+function renderLeaguePill(league) {
+  const el = document.getElementById("leaguePill");
+  if (!el) return;
+  if (!league) { el.innerHTML = ""; return; }
+  el.innerHTML = `<span class="league-pill"><span class="dot"></span>${league}</span>`;
 }
 
 function renderLaneEdges(lanes, t1, t2) {
@@ -741,6 +796,7 @@ document.getElementById("predictBtn").addEventListener("click", async () => {
     document.getElementById("modelTag").textContent = j.model;
     document.getElementById("featDump").textContent = JSON.stringify(j.features, null, 2);
 
+    renderLeaguePill(j.league);
     renderWhyPanel(j.explanation, j.team1, j.team2);
     renderLaneEdges(j.lane_advantages || [], j.team1, j.team2);
 

@@ -61,6 +61,7 @@ class PredictRequest(BaseModel):
     team2: str
     team1_side: str = "Blue"
     patch: Optional[str] = None
+    league: Optional[str] = None  # If omitted, inferred from team1's primary league
     team1_players: Optional[List[PlayerSelectionDTO]] = None
     team2_players: Optional[List[PlayerSelectionDTO]] = None
 
@@ -569,6 +570,8 @@ def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: di
     t2_pchamp = feats.get("team2_player_champ_wr", 0.5)
     t1_cg     = feats.get("team1_champ_global_wr", 0.5)
     t2_cg     = feats.get("team2_champ_global_wr", 0.5)
+    t1_cl     = feats.get("team1_champ_league_wr", 0.5)
+    t2_cl     = feats.get("team2_champ_league_wr", 0.5)
     return {
         "team1_games":     feats.get("team1_games", 0.0),
         "team1_winrate":   feats.get("team1_winrate", 0.0),
@@ -589,6 +592,8 @@ def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: di
         "team2_p_kda":     feats.get("team2_player_kda_avg", 0.0),
         "team1_champ_global_wr": t1_cg,
         "team2_champ_global_wr": t2_cg,
+        "team1_champ_league_wr": t1_cl,
+        "team2_champ_league_wr": t2_cl,
         "team1_pchamp_wr":       t1_pchamp,
         "team2_pchamp_wr":       t2_pchamp,
         "champ_matchup_wr":      feats.get("champ_matchup_wr", 0.5),
@@ -596,6 +601,7 @@ def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: di
         "p_wr_diff":       feats.get("pwr_diff", 0.0),
         "side_wr_diff":    (side_wr_t1 or 0.0) - (side_wr_t2 or 0.0),
         "champ_global_diff": t1_cg - t2_cg,
+        "champ_league_diff": t1_cl - t2_cl,
         "pchamp_diff":       t1_pchamp - t2_pchamp,
     }
 
@@ -607,7 +613,8 @@ _FEATURE_GROUPS: dict[str, list[str]] = {
                           "team1_avg_len", "team2_avg_len", "wr_diff"],
     "player_form":       ["team1_p_winrate", "team2_p_winrate", "team1_p_games", "team2_p_games",
                           "team1_p_kda", "team2_p_kda", "p_wr_diff"],
-    "champion_picks":    ["team1_champ_global_wr", "team2_champ_global_wr", "champ_global_diff"],
+    "champion_picks":    ["team1_champ_global_wr", "team2_champ_global_wr", "champ_global_diff",
+                          "team1_champ_league_wr", "team2_champ_league_wr", "champ_league_diff"],
     "player_on_champion":["team1_pchamp_wr", "team2_pchamp_wr", "pchamp_diff"],
     "champion_matchup":  ["champ_matchup_wr"],
     "head_to_head":      ["h2h_team1_wr", "h2h_games"],
@@ -728,6 +735,7 @@ def predict(req: PredictRequest):
         team2=req.team2,
         patch=req.patch,
         team1_side=req.team1_side,
+        league=req.league,
         team1_players=[PlayerSelection(**p.model_dump()) for p in (req.team1_players or [])],
         team2_players=[PlayerSelection(**p.model_dump()) for p in (req.team2_players or [])],
     )
@@ -755,7 +763,8 @@ def predict(req: PredictRequest):
         "team1_win_probability": round(p, 4),
         "team2_win_probability": round(1 - p, 4),
         "model": which,
-        "features": {k: round(v, 4) for k, v in feats.items()},
+        "league": feats.get("league_context") or None,
+        "features": {k: (round(v, 4) if isinstance(v, (int, float)) else v) for k, v in feats.items()},
         "explanation": explanation,
         "lane_advantages": lanes,
     }

@@ -38,6 +38,7 @@ class MatchInput:
     team1_side: str = "Blue"                # 'Blue' or 'Red'
     team1_players: Optional[List[PlayerSelection]] = None
     team2_players: Optional[List[PlayerSelection]] = None
+    league: Optional[str] = None            # None => auto-detect from team1's most-played league
 
 
 def _team_recent(conn: sqlite3.Connection, team: str) -> Dict[str, float]:
@@ -165,18 +166,45 @@ def _player_champ(conn: sqlite3.Connection, player: str, champion: str) -> Dict[
     }
 
 
-def _champion_global(conn: sqlite3.Connection, champion: str) -> Dict[str, float]:
-    row = conn.execute(
-        f"""
+def _champion_global(
+    conn: sqlite3.Connection,
+    champion: str,
+    league: Optional[str] = None,
+) -> Dict[str, float]:
+    """Global WR for a champion. When `league` is given, filters to that league.
+
+    Returns games + winrate. Caller decides whether the sample is large enough
+    to trust (e.g. 5+ games) and falls back to the cross-league number if not.
+    """
+    sql = f"""
         SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
         FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
         WHERE pg.champion = :c
-        """,
-        {"c": champion},
-    ).fetchone()
+    """
+    params: Dict[str, object] = {"c": champion}
+    if league:
+        sql += " AND m.league_code = :lg"
+        params["lg"] = league
+    row = conn.execute(sql, params).fetchone()
     g = row["g"] or 0
     w = row["w"] or 0
     return {"games": float(g), "winrate": (w / g) if g else 0.5}
+
+
+def _team_primary_league(conn: sqlite3.Connection, team: str) -> Optional[str]:
+    """League where the team plays most often within the patch window."""
+    row = conn.execute(
+        """
+        SELECT league_code, COUNT(*) AS g
+        FROM matches
+        WHERE team1 = :t OR team2 = :t
+        GROUP BY league_code
+        ORDER BY g DESC
+        LIMIT 1
+        """,
+        {"t": team},
+    ).fetchone()
+    return row["league_code"] if row and row["league_code"] else None
 
 
 def _champion_matchup(conn: sqlite3.Connection, c1: str, c2: str) -> Dict[str, float]:
@@ -212,6 +240,11 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
 
         feats["team1_side_blue"] = 1.0 if inp.team1_side == "Blue" else 0.0
 
+        # Resolve the league context for champion-pool WR. Caller can override;
+        # otherwise we infer from team1 (teams almost always share their league).
+        league = inp.league or _team_primary_league(conn, inp.team1)
+        feats["league_context"] = league or ""
+
         team1_picks = inp.team1_players or []
         team2_picks = inp.team2_players or []
         for prefix, players in (("team1", team1_picks), ("team2", team2_picks)):
@@ -219,6 +252,7 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
             kda_sum = 0.0
             cwr_sum = 0.0; cwr_n = 0
             gwr_sum = 0.0; gwr_n = 0
+            lwr_sum = 0.0; lwr_n = 0
             for sel in players:
                 pr = _player_recent(conn, sel.player)
                 pc = _player_champ(conn, sel.player, sel.champion)
@@ -228,6 +262,14 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
                 if pc["champ_games"] > 0:
                     cwr_sum += pc["champ_winrate"]
                     cwr_n   += 1
+                # League-specific WR with cross-league fallback. When the
+                # in-league sample is too thin (<5g), reuse the global number
+                # so the feature is still informative.
+                in_league = _champion_global(conn, sel.champion, league=league) if league else None
+                if in_league and in_league["games"] >= 5:
+                    lwr_sum += in_league["winrate"]; lwr_n += 1
+                elif cg["games"] >= 3:
+                    lwr_sum += cg["winrate"]; lwr_n += 1
                 if cg["games"] >= 3:
                     gwr_sum += cg["winrate"]
                     gwr_n   += 1
@@ -237,6 +279,7 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
             feats[f"{prefix}_player_champ_wr"]  = (cwr_sum / cwr_n) if cwr_n else 0.5
             feats[f"{prefix}_player_champ_n"]   = float(cwr_n)
             feats[f"{prefix}_champ_global_wr"]  = (gwr_sum / gwr_n) if gwr_n else 0.5
+            feats[f"{prefix}_champ_league_wr"]  = (lwr_sum / lwr_n) if lwr_n else 0.5
 
         # Per-role champion-vs-champion matchup WR (team1 perspective).
         by_role_t1 = {p.role: p.champion for p in team1_picks if p.role and p.champion}
@@ -255,6 +298,7 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
     feats["pwr_diff"]          = feats["team1_player_wr_avg"] - feats["team2_player_wr_avg"]
     feats["champ_diff"]        = feats["team1_player_champ_wr"] - feats["team2_player_champ_wr"]
     feats["champ_global_diff"] = feats["team1_champ_global_wr"] - feats["team2_champ_global_wr"]
+    feats["champ_league_diff"] = feats["team1_champ_league_wr"] - feats["team2_champ_league_wr"]
     return feats
 
 

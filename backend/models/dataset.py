@@ -12,7 +12,7 @@ the lineup is known).
 """
 from __future__ import annotations
 import sqlite3
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from backend.db.schema import get_conn
 
@@ -123,14 +123,21 @@ def _team_player_form(conn: sqlite3.Connection, team: str, before: str) -> Dict[
     }
 
 
-def _team_champion_form(conn: sqlite3.Connection, game_id: str, before: str) -> Dict[str, Dict[str, float]]:
+def _team_champion_form(
+    conn: sqlite3.Connection,
+    game_id: str,
+    before: str,
+    league: Optional[str] = None,
+) -> Dict[str, Dict[str, float]]:
     """For each side of `game_id`, compute aggregate champion-pool stats prior to
     `before`:
-      - lineup_global_wr: average global WR of each champion picked
-      - player_on_champ_wr: average of (this player's WR on this champion)
-      - matchup_wr: average WR of (champion1 vs same-role champion2), team1 perspective
-    Returns {"team1": {...}, "team2": {...}} with keys for the metrics. Missing
-    data falls back to 0.5 so a "no signal" row contributes nothing.
+      - global_wr:           average global WR of each champion picked
+      - league_wr:           average WR of each champion picked, filtered to `league`
+                             when given (with a global fallback when in-league sample
+                             is too thin)
+      - player_on_champ_wr:  average of (this player's WR on this champion)
+      - matchup_wr:          average WR of (champion1 vs same-role champion2),
+                             team1 perspective
     """
     picks = conn.execute(
         """
@@ -141,10 +148,8 @@ def _team_champion_form(conn: sqlite3.Connection, game_id: str, before: str) -> 
         {"g": game_id},
     ).fetchall()
     if not picks:
-        return {
-            "team1": {"global_wr": 0.5, "player_on_champ_wr": 0.5, "matchup_wr": 0.5, "n": 0.0},
-            "team2": {"global_wr": 0.5, "player_on_champ_wr": 0.5, "matchup_wr": 0.5, "n": 0.0},
-        }
+        empty = {"global_wr": 0.5, "league_wr": 0.5, "player_on_champ_wr": 0.5, "matchup_wr": 0.5, "n": 0.0}
+        return {"team1": dict(empty), "team2": dict(empty)}
 
     # Identify which side is team1 vs team2 for this match.
     m_row = conn.execute(
@@ -162,6 +167,7 @@ def _team_champion_form(conn: sqlite3.Connection, game_id: str, before: str) -> 
     out: Dict[str, Dict[str, float]] = {}
     for bucket, picks_list in by_team.items():
         gw_sum = 0.0; gw_n = 0
+        lw_sum = 0.0; lw_n = 0
         pw_sum = 0.0; pw_n = 0
         for sel in picks_list:
             r = conn.execute(
@@ -175,6 +181,25 @@ def _team_champion_form(conn: sqlite3.Connection, game_id: str, before: str) -> 
             g, w = r["g"] or 0, r["w"] or 0
             if g >= 3:
                 gw_sum += w / g; gw_n += 1
+            # League-filtered WR with cross-league fallback when in-league is sparse.
+            if league:
+                rl = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
+                    FROM player_games pg JOIN matches m ON m.game_id = pg.game_id
+                    WHERE pg.champion = :c
+                      AND m.datetime_utc < :before
+                      AND m.league_code = :lg
+                    """,
+                    {"c": sel["champion"], "before": before, "lg": league},
+                ).fetchone()
+                gl, wl = rl["g"] or 0, rl["w"] or 0
+                if gl >= 5:
+                    lw_sum += wl / gl; lw_n += 1
+                elif g >= 3:
+                    lw_sum += w / g; lw_n += 1
+            elif g >= 3:
+                lw_sum += w / g; lw_n += 1
             r2 = conn.execute(
                 f"""
                 SELECT COUNT(*) AS g, SUM({_WIN_EXPR}) AS w
@@ -188,6 +213,7 @@ def _team_champion_form(conn: sqlite3.Connection, game_id: str, before: str) -> 
                 pw_sum += w2 / g2; pw_n += 1
         out[bucket] = {
             "global_wr": (gw_sum / gw_n) if gw_n else 0.5,
+            "league_wr": (lw_sum / lw_n) if lw_n else 0.5,
             "player_on_champ_wr": (pw_sum / pw_n) if pw_n else 0.5,
             "n": float(len(picks_list)),
         }
@@ -253,7 +279,7 @@ def build_training_rows() -> List[Dict[str, float]]:
             h2h_g, h2h_t1wr = _h2h(conn, t1, t2, before)
             pf1 = _team_player_form(conn, t1, before)
             pf2 = _team_player_form(conn, t2, before)
-            cf  = _team_champion_form(conn, m["game_id"], before)
+            cf  = _team_champion_form(conn, m["game_id"], before, league=m["league_code"])
 
             row = {
                 "match_dt":          before,
@@ -277,6 +303,8 @@ def build_training_rows() -> List[Dict[str, float]]:
                 "team2_p_kda":       pf2["p_kda"],
                 "team1_champ_global_wr": cf["team1"]["global_wr"],
                 "team2_champ_global_wr": cf["team2"]["global_wr"],
+                "team1_champ_league_wr": cf["team1"]["league_wr"],
+                "team2_champ_league_wr": cf["team2"]["league_wr"],
                 "team1_pchamp_wr":       cf["team1"]["player_on_champ_wr"],
                 "team2_pchamp_wr":       cf["team2"]["player_on_champ_wr"],
                 "champ_matchup_wr":      cf["team1"]["matchup_wr"],
@@ -284,6 +312,7 @@ def build_training_rows() -> List[Dict[str, float]]:
                 "p_wr_diff":         pf1["p_winrate"] - pf2["p_winrate"],
                 "side_wr_diff":      t1_side_wr - t2_side_wr,
                 "champ_global_diff": cf["team1"]["global_wr"] - cf["team2"]["global_wr"],
+                "champ_league_diff": cf["team1"]["league_wr"] - cf["team2"]["league_wr"],
                 "pchamp_diff":       cf["team1"]["player_on_champ_wr"] - cf["team2"]["player_on_champ_wr"],
                 "target":            1 if m["winner"] == 1 else 0,
             }
@@ -301,9 +330,10 @@ FEATURE_COLS: List[str] = [
     "team1_p_games", "team1_p_winrate", "team1_p_kda",
     "team2_p_games", "team2_p_winrate", "team2_p_kda",
     "team1_champ_global_wr", "team2_champ_global_wr",
+    "team1_champ_league_wr", "team2_champ_league_wr",
     "team1_pchamp_wr", "team2_pchamp_wr", "champ_matchup_wr",
     "wr_diff", "p_wr_diff", "side_wr_diff",
-    "champ_global_diff", "pchamp_diff",
+    "champ_global_diff", "champ_league_diff", "pchamp_diff",
 ]
 
 
