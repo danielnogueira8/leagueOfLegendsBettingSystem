@@ -354,14 +354,27 @@ def build_features(inp: MatchInput) -> Dict[str, float]:
                         cg["games"] * cg["winrate"], cg["games"], 0.5,
                     )
 
-            n = max(len(players), 1)
-            feats[f"{prefix}_player_wr_avg"]    = wr_sum / n
-            feats[f"{prefix}_player_kda_avg"]   = kda_sum / n
-            feats[f"{prefix}_player_champ_wr"]  = cwr_sum / n
-            feats[f"{prefix}_player_champ_n"]   = float(cwr_n_raw)
-            feats[f"{prefix}_pchamp_n_total"]   = float(pchamp_n_total)
-            feats[f"{prefix}_champ_global_wr"]  = gwr_sum / n
-            feats[f"{prefix}_champ_league_wr"]  = lwr_sum / n
+            # When no players were provided, fall back to the training-mean
+            # neutral value (0.5 for shrunken winrates) instead of dividing 0/1
+            # and producing 0.0 — that would look like a wild outlier to the
+            # standardized model and produce spurious extreme predictions.
+            if players:
+                n = len(players)
+                feats[f"{prefix}_player_wr_avg"]    = wr_sum / n
+                feats[f"{prefix}_player_kda_avg"]   = kda_sum / n
+                feats[f"{prefix}_player_champ_wr"]  = cwr_sum / n
+                feats[f"{prefix}_player_champ_n"]   = float(cwr_n_raw)
+                feats[f"{prefix}_pchamp_n_total"]   = float(pchamp_n_total)
+                feats[f"{prefix}_champ_global_wr"]  = gwr_sum / n
+                feats[f"{prefix}_champ_league_wr"]  = lwr_sum / n
+            else:
+                feats[f"{prefix}_player_wr_avg"]    = 0.5
+                feats[f"{prefix}_player_kda_avg"]   = 3.0   # rough roster-average KDA
+                feats[f"{prefix}_player_champ_wr"]  = 0.5
+                feats[f"{prefix}_player_champ_n"]   = 0.0
+                feats[f"{prefix}_pchamp_n_total"]   = 0.0
+                feats[f"{prefix}_champ_global_wr"]  = 0.5
+                feats[f"{prefix}_champ_league_wr"]  = 0.5
 
         # Per-role champion-vs-champion matchup WR (team1 perspective).
         by_role_t1 = {p.role: p.champion for p in team1_picks if p.role and p.champion}

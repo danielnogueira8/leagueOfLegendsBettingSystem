@@ -210,6 +210,8 @@
       padding: 0 6px;
     }
     .why-row .half .pct.muted { color: var(--muted); text-shadow: none; }
+    .why-row.unused { opacity: 0.45; }
+    .why-row.unused .half .track { background: rgba(255,255,255,0.02); }
     .why-empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
 
     .league-pill {
@@ -697,17 +699,23 @@ function renderWhyPanel(explanation, t1, t2) {
     const widthPct = (Math.abs(d) / maxAbs) * 100;  // 0–100% of the half-track
     const favorsT1 = d > 0.0005;
     const favorsT2 = d < -0.0005;
-    const tooltip = favorsT1 ? `Favors ${t1} by ${pct}%`
-                  : favorsT2 ? `Favors ${t2} by ${pct}%`
-                  : "Neutral";
-    const t1Cell = favorsT1
+    // `used: false` means every feature in this group has a zero coefficient
+    // (model isn't using this signal at all). Distinguishing these from
+    // "neutral on this matchup" prevents the misleading row of dashes.
+    const unused = g.used === false;
+    const tooltip = unused
+      ? `Model isn't using this signal (coefficients zero after regularization)`
+      : favorsT1 ? `Favors ${t1} by ${pct}%`
+      : favorsT2 ? `Favors ${t2} by ${pct}%`
+      : "Neutral on this matchup";
+    const t1Cell = favorsT1 && !unused
       ? `<div class="half left"><div class="track"></div><div class="fill" style="width:${widthPct}%"></div><span class="pct">+${pct}%</span></div>`
-      : `<div class="half left"><div class="track"></div><span class="pct muted">${favorsT2 ? "" : "—"}</span></div>`;
-    const t2Cell = favorsT2
+      : `<div class="half left"><div class="track"></div><span class="pct muted">${unused ? "off" : favorsT2 ? "" : "—"}</span></div>`;
+    const t2Cell = favorsT2 && !unused
       ? `<div class="half right"><div class="track"></div><div class="fill" style="width:${widthPct}%"></div><span class="pct">+${pct}%</span></div>`
-      : `<div class="half right"><div class="track"></div><span class="pct muted">${favorsT1 ? "" : "—"}</span></div>`;
+      : `<div class="half right"><div class="track"></div><span class="pct muted">${unused ? "off" : favorsT1 ? "" : "—"}</span></div>`;
     return `
-      <div class="why-row" title="${tooltip}">
+      <div class="why-row${unused ? " unused" : ""}" title="${tooltip}">
         <div class="label">${GROUP_LABELS[g.group] || g.group}</div>
         ${t1Cell}
         ${t2Cell}

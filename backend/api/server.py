@@ -653,31 +653,39 @@ def _explain_prediction(model, cols: list[str], mfeats: dict, full_p: float) -> 
     col_to_idx = {c: i for i, c in enumerate(cols)}
     base_x = [mfeats[c] for c in cols]
 
+    # Identify which features the model actually uses, so we can suppress
+    # explanation rows for feature groups that are structurally disabled
+    # (every coefficient zero, e.g. when L1 deselected the whole group).
+    coefs = model.named_steps["lr"].coef_[0]
+    active_features = {cols[i] for i, w in enumerate(coefs) if abs(w) > 1e-6}
+
     def proba(x_row):
         return float(model.predict_proba([x_row])[0][1])
 
     groups_out = []
     for group, feature_names in _FEATURE_GROUPS.items():
         x_neutral = list(base_x)
-        active = []
-        for fname in feature_names:
-            i = col_to_idx.get(fname)
-            if i is None:
-                continue
-            x_neutral[i] = means[i]  # hold at training mean -> zero standardized contribution
-            active.append(fname)
-        if not active:
+        group_features_in_model = [f for f in feature_names if f in col_to_idx]
+        if not group_features_in_model:
             continue
+        # If none of the group's features have non-zero coefs, the model isn't
+        # using this group at all. Surface as `used=False` so the frontend can
+        # collapse / hide the row instead of showing "—".
+        group_active = [f for f in group_features_in_model if f in active_features]
+        for fname in group_features_in_model:
+            x_neutral[col_to_idx[fname]] = means[col_to_idx[fname]]
         p_without = proba(x_neutral)
         delta = full_p - p_without
         groups_out.append({
-            "group": group,
+            "group":            group,
             "delta_team1_prob": round(delta, 4),  # +ve favors team1, -ve favors team2
             "p_without_group":  round(p_without, 4),
+            "used":             bool(group_active),
+            "active_features":  group_active,
         })
 
-    # Sort by absolute impact, biggest first.
-    groups_out.sort(key=lambda r: -abs(r["delta_team1_prob"]))
+    # Sort by absolute impact, biggest first. Unused groups go to the bottom.
+    groups_out.sort(key=lambda r: (not r["used"], -abs(r["delta_team1_prob"])))
     return {"groups": groups_out}
 
 
