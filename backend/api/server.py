@@ -38,6 +38,7 @@ from backend.features.build import (
 )
 from backend.models.train import load_model
 from backend.models.dataset import FEATURE_COLS
+from backend.markets.value import find_value_bets
 
 # Ensure the SQLite schema exists at boot. On a fresh deploy with an empty
 # mounted volume (e.g. Railway) the DB file doesn't exist yet — without this,
@@ -560,6 +561,67 @@ def recent_matches(team: Optional[str] = None, limit: int = 20):
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- Polymarket value bets ---------- #
+#
+# Pulls current LoL markets from Polymarket and ranks them by expected edge
+# vs our model. Cached briefly so a busy dashboard doesn't pummel Polymarket.
+# IMPORTANT: This is research, not advice — see filters and disclaimer below.
+
+@app.get("/value-bets")
+def value_bets(
+    min_edge:    float = 0.05,           # 5pp minimum edge (above ~2pp Polymarket vig)
+    min_volume:  float = 5000.0,         # below this you can't actually fill a meaningful bet
+    kinds:       Optional[str] = None,   # comma-separated: "series,game"
+    exclude_certain: bool = True,        # drop markets priced at extreme < 1% / > 99% (likely live/settled)
+):
+    """Find Polymarket markets where our model's probability differs from the
+    market's by at least `min_edge` (positive value). Sorted by edge.
+
+    Filters:
+      - `min_volume`: skip thin markets you can't realistically fill
+      - `exclude_certain`: drop in-progress / already-decided games where the
+        market sits at < 1% or > 99% (those are not "edges", they're just
+        our model being out of date)
+
+    Returns a list of objects with model/market probabilities, edge, EV, and
+    Kelly stake suggestions (full Kelly + a more conservative ¼ Kelly).
+    """
+    kinds_list = None
+    if kinds:
+        kinds_list = [k.strip() for k in kinds.split(",") if k.strip()]
+
+    # The cache key encodes the filter args so we don't return stale results
+    # for one user when another asked for different filters.
+    cache_key = f"value:{min_edge}:{min_volume}:{kinds}:{exclude_certain}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        bets = find_value_bets(min_edge=min_edge, min_volume=min_volume, kinds=kinds_list)
+    except Exception as e:
+        # Don't 500 on Polymarket hiccups — return an explanatory empty list.
+        return _cache_put(cache_key, {
+            "bets":    [],
+            "fetched_at": time.time(),
+            "warning": f"Polymarket fetch failed: {type(e).__name__}",
+        })
+
+    if exclude_certain:
+        bets = [b for b in bets if 0.01 <= b["market_prob"] <= 0.99]
+
+    return _cache_put(cache_key, {
+        "bets":       bets,
+        "fetched_at": time.time(),
+        "filters":    {
+            "min_edge":  min_edge,
+            "min_volume": min_volume,
+            "kinds":     kinds_list,
+            "exclude_certain": exclude_certain,
+        },
+    })
 
 
 def _model_features_from_live(team1: str, team2: str, team1_side: str, feats: dict) -> dict:

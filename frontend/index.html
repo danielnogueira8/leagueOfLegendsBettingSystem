@@ -300,6 +300,70 @@
       .grid-2 { grid-template-columns: 1fr; }
     }
 
+    /* Tabs */
+    .tabs {
+      display: flex; gap: 6px; margin-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .tab-btn {
+      width: auto; background: transparent; border: none;
+      color: var(--muted); padding: 10px 16px; cursor: pointer;
+      font-size: 14px; font-weight: 500;
+      border-bottom: 2px solid transparent; border-radius: 0;
+      transition: color 120ms, border-color 120ms;
+    }
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    /* Value bets layout */
+    .value-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+    .value-header button { padding: 8px 14px; }
+    .value-controls {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+      margin-bottom: 8px;
+    }
+    @media (max-width: 760px) {
+      .value-controls { grid-template-columns: 1fr 1fr; }
+    }
+    .vb-table {
+      display: grid;
+      grid-template-columns: 110px 1fr 80px 80px 80px 90px 100px;
+      gap: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      font-size: 13px;
+    }
+    .vb-table > div {
+      padding: 10px 12px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center;
+    }
+    .vb-table .head {
+      background: var(--bg2); color: var(--muted);
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
+    }
+    .vb-table .row.high     { background: rgba(63,185,80,0.06); }
+    .vb-table .row.medium   { background: rgba(63,185,80,0.02); }
+    .vb-table .row:nth-child(2n+8) { background-color: rgba(255,255,255,0.01); }
+    .vb-table .matchcol { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+    .vb-table .matchcol .meta { color: var(--muted); font-size: 11px; }
+    .vb-table .pick { font-weight: 700; color: var(--text); }
+    .vb-table .num { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .vb-table .edge.pos { color: var(--good); }
+    .vb-table a { color: var(--accent); text-decoration: none; }
+    .vb-table a:hover { text-decoration: underline; }
+    @media (max-width: 760px) {
+      .vb-table { grid-template-columns: 1fr 70px 70px 70px; font-size: 12px; }
+      .vb-table .head:nth-child(1), .vb-table .row > div:nth-child(7n+1) { display: none; } /* hide kickoff */
+      .vb-table .head:nth-child(6), .vb-table .row > div:nth-child(7n+6) { display: none; } /* hide kelly */
+      .vb-table .head:nth-child(7), .vb-table .row > div:nth-child(7n) { display: none; }   /* hide link col */
+    }
+
+    .disclaimer {
+      margin-top: 18px; padding: 12px 14px;
+      background: rgba(248,81,73,0.08);
+      border: 1px solid rgba(248,81,73,0.25);
+      border-radius: 8px;
+      color: #ffb1ac; font-size: 12px; line-height: 1.5;
+    }
+
     .toast {
       position: fixed; right: 22px; bottom: 22px;
       background: var(--card); border: 1px solid var(--border); padding: 10px 14px; border-radius: 10px;
@@ -328,6 +392,12 @@
   </header>
 
   <main>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="predict">Predict</button>
+      <button class="tab-btn" data-tab="value">Value bets</button>
+    </div>
+
+    <section data-tab-pane="predict">
     <div class="card">
       <h2>Predict a match</h2>
       <div class="matchup">
@@ -418,6 +488,56 @@
         <pre id="featDump"></pre>
       </details>
     </div>
+    </section>
+
+    <section data-tab-pane="value" hidden>
+      <div class="card">
+        <div class="value-header">
+          <div>
+            <h2 style="margin:0">Value bets <span class="muted" style="font-size:13px;font-weight:400">· model vs Polymarket</span></h2>
+            <div class="muted" style="font-size:12px;margin-top:4px">
+              Markets where our model's probability differs from Polymarket's.
+              Sorted by edge. Numbers are research, not advice — see the disclaimer below.
+            </div>
+          </div>
+          <button class="secondary" id="vbRefresh" style="width:auto">Refresh</button>
+        </div>
+
+        <div class="value-controls">
+          <div>
+            <label>Min edge (pp)</label>
+            <input type="number" id="vbMinEdge" min="0" max="50" step="1" value="8" />
+          </div>
+          <div>
+            <label>Min volume ($)</label>
+            <input type="number" id="vbMinVol" min="0" step="1000" value="20000" />
+          </div>
+          <div>
+            <label>Market type</label>
+            <select id="vbKinds">
+              <option value="">Any (series + per-game)</option>
+              <option value="series" selected>Series only</option>
+              <option value="game">Per-game only</option>
+            </select>
+          </div>
+          <div>
+            <label>Bankroll ($)</label>
+            <input type="number" id="vbBankroll" min="0" step="100" value="1000" />
+          </div>
+        </div>
+
+        <div id="vbStatus" class="muted" style="margin:14px 0 6px">Click Refresh to load.</div>
+        <div id="vbTable"></div>
+
+        <div class="disclaimer">
+          ⚠️ This dashboard is for research only. The model's calibration hasn't been
+          verified against historical Polymarket prices yet — a "+15% edge" today may
+          actually be 0% real edge. Polymarket charges ~2% on resolution, so true edges
+          under 2pp aren't bets at all. Don't size positions you can't afford to lose.
+          Live games / handicaps are filtered out by the "exclude_certain" flag.
+        </div>
+      </div>
+    </section>
   </main>
 
   <div class="toast" id="toast"></div>
@@ -919,6 +1039,113 @@ document.getElementById("predictBtn").addEventListener("click", async () => {
   } finally {
     btn.disabled = false; btn.textContent = "Predict winner";
   }
+});
+
+// --- Tab switching ---
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const tab = btn.dataset.tab;
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b === btn));
+    document.querySelectorAll("[data-tab-pane]").forEach(p => {
+      p.hidden = p.dataset.tabPane !== tab;
+    });
+    if (tab === "value" && !document.getElementById("vbTable").innerHTML) {
+      loadValueBets();
+    }
+  });
+});
+
+// --- Value bets ---
+function fmtKickoff(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const now = new Date();
+  const diffH = (d - now) / 36e5;
+  if (diffH < 0)         return "live / past";
+  if (diffH < 24)        return d.toLocaleString([], {hour: "2-digit", minute: "2-digit"});
+  if (diffH < 24 * 7)    return d.toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+  return d.toLocaleDateString([], {month: "short", day: "numeric"});
+}
+function polymarketSearchUrl(eventTitle) {
+  // No public deep-link by event id; pasting into the search field works.
+  return `https://polymarket.com/markets?q=${encodeURIComponent(eventTitle.replace(/^LoL: /, "").split(" - ")[0])}`;
+}
+
+async function loadValueBets() {
+  const minEdge = (parseFloat(document.getElementById("vbMinEdge").value) || 8) / 100;
+  const minVol  = parseFloat(document.getElementById("vbMinVol").value)  || 5000;
+  const kinds   = document.getElementById("vbKinds").value;
+  const status  = document.getElementById("vbStatus");
+  const table   = document.getElementById("vbTable");
+  const bankroll = parseFloat(document.getElementById("vbBankroll").value) || 0;
+
+  status.textContent = "Loading current Polymarket prices… (~10s)";
+  table.innerHTML = "";
+
+  let qs = `?min_edge=${minEdge}&min_volume=${minVol}`;
+  if (kinds) qs += `&kinds=${encodeURIComponent(kinds)}`;
+  qs += "&exclude_certain=true";
+
+  try {
+    const r = await fetch(API + "/value-bets" + qs);
+    if (!r.ok) {
+      status.textContent = `Error: HTTP ${r.status}`;
+      return;
+    }
+    const data = await r.json();
+    const bets = data.bets || [];
+    if (data.warning) {
+      status.innerHTML = `<span style="color:var(--bad)">${data.warning}</span>`;
+      return;
+    }
+    if (!bets.length) {
+      status.textContent = "No value bets matching these filters right now.";
+      return;
+    }
+    status.textContent = `${bets.length} bet${bets.length===1?"":"s"} found · model probabilities reflect cached training, refresh after retraining for latest`;
+
+    const head = `
+      <div class="head">Kickoff</div>
+      <div class="head">Match · pick</div>
+      <div class="head">Model</div>
+      <div class="head">Market</div>
+      <div class="head">Edge</div>
+      <div class="head">¼ Kelly</div>
+      <div class="head"></div>
+    `;
+    const rows = bets.map(b => {
+      const kindLabel = b.kind === "game" ? `Game ${b.game_number}` : `Bo${b.bo} series`;
+      const edgeCls = b.edge_pp >= 0.15 ? "high" : b.edge_pp >= 0.08 ? "medium" : "";
+      const pct = (x) => `${(x * 100).toFixed(1)}%`;
+      const kellyAmt = bankroll > 0 && b.quarter_kelly_pct > 0
+        ? ` · $${(bankroll * b.quarter_kelly_pct / 100).toFixed(0)}`
+        : "";
+      const matchTitle = b.event_title.replace(/^LoL: /, "").split(" - ")[0];
+      const leagueLabel = b.league_hint ? `<span class="meta">${b.league_hint} · ${kindLabel}</span>` : `<span class="meta">${kindLabel}</span>`;
+      return `
+        <div class="row ${edgeCls}">${fmtKickoff(b.end_iso)}</div>
+        <div class="row ${edgeCls} matchcol">
+          <span><span class="pick">${b.favored_market_name}</span> <span class="muted">vs ${b.opponent_team}</span></span>
+          ${leagueLabel}
+        </div>
+        <div class="row ${edgeCls} num">${pct(b.model_prob)}</div>
+        <div class="row ${edgeCls} num">${pct(b.market_prob)}</div>
+        <div class="row ${edgeCls} num edge pos">+${(b.edge_pp*100).toFixed(1)}pp</div>
+        <div class="row ${edgeCls} num">${b.quarter_kelly_pct.toFixed(1)}%${kellyAmt}</div>
+        <div class="row ${edgeCls}"><a href="${polymarketSearchUrl(b.event_title)}" target="_blank" rel="noopener">Polymarket ↗</a></div>
+      `;
+    }).join("");
+
+    table.innerHTML = `<div class="vb-table">${head}${rows}</div>`;
+  } catch (e) {
+    status.textContent = "Network error: " + e;
+  }
+}
+
+document.getElementById("vbRefresh").addEventListener("click", loadValueBets);
+// Recompute Kelly stake amounts when bankroll changes (no fetch needed).
+document.getElementById("vbBankroll").addEventListener("input", () => {
+  if (document.getElementById("vbTable").innerHTML) loadValueBets();
 });
 </script>
 </body>
