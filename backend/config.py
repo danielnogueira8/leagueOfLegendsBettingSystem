@@ -13,8 +13,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "lol_betting.db"
 
-# How many patches back to ingest (current + N-1 prior). 3 means current + 2 prior.
-PATCH_WINDOW = 3
+# How many patches back to ingest (current + N-1 prior). 4 means current + 3 prior.
+# E.g. on patch 26.09 we ingest 26.06, 26.07, 26.08, 26.09. Wider window means
+# more training data per refresh at the cost of including slightly older meta.
+PATCH_WINDOW = 4
 
 # Leaguepedia exposes leagues via two fields:
 #   - Leagues.League_Short (e.g. "LCK")
@@ -25,9 +27,9 @@ LEAGUES = {
     # Major regions
     "LCK":   {"league_full": "LoL Champions Korea",                            "tier": "major"},
     "LEC":   {"league_full": "LoL EMEA Championship",                          "tier": "major"},
-    # NA's LCS was rebranded to LTA in 2025. We include both LTA (combined) and
-    # the regional splits LTA N (North) / LTA S (South). Pre-rebrand history is
-    # already filtered out by our 3-patch window, so leaving "LCS" out is fine.
+    # NA: LCS still operates (was NOT replaced by LTA — LTA is a separate
+    # tournament running in parallel for select teams across the Americas).
+    "LCS":   {"league_full": "League of Legends Championship Series",                 "tier": "major"},
     "LTA":   {"league_full": "League of Legends Championship of The Americas",        "tier": "major"},
     "LTAN":  {"league_full": "League of Legends Championship of The Americas North",  "tier": "major"},
     "LTAS":  {"league_full": "League of Legends Championship of The Americas South",  "tier": "major"},
@@ -36,6 +38,7 @@ LEAGUES = {
     "MSI":   {"league_full": "Mid-Season Invitational",                        "tier": "international"},
     "WCS":   {"league_full": "World Championship",                             "tier": "international"},
     "FST":   {"league_full": "First Stand",                                    "tier": "international"},
+    "EWC":   {"league_full": "Esports World Cup",                              "tier": "international"},
     # Asia-Pacific (LCP replaced PCS/VCS in 2025; we keep both for backfill)
     "LCP":   {"league_full": "League of Legends Championship Pacific",         "tier": "major"},
     "PCS":   {"league_full": "Pacific Championship Series",                    "tier": "major"},
