@@ -648,16 +648,28 @@ def _explain_prediction(model, cols: list[str], mfeats: dict, full_p: float) -> 
     deltas don't sum exactly to (full_p - 0.5). They sum approximately, which
     is fine for explanation — the relative magnitudes are what matters.
     """
-    scaler = model.named_steps["scaler"]
-    means = list(scaler.mean_)
+    # Two model shapes are possible: the logistic-regression pipelines
+    # (scaler + lr) and the bare GradientBoostingClassifier. The pipeline
+    # case lets us neutralize features by setting them to the training mean
+    # AND introspect coefficients to know which features matter. For a tree
+    # model we don't have either: there's no scaler and no .coef_. We fall
+    # back to neutralizing with 0.5 (the priors used in the live builder)
+    # and treating every feature with non-zero `feature_importances_` as
+    # active.
+    is_pipeline = hasattr(model, "named_steps")
+    if is_pipeline:
+        scaler = model.named_steps["scaler"]
+        means = list(scaler.mean_)
+        coefs = model.named_steps["lr"].coef_[0]
+        active_features = {cols[i] for i, w in enumerate(coefs) if abs(w) > 1e-6}
+    else:
+        # Bare classifier (e.g. GradientBoostingClassifier). No scaler, no coefs.
+        means = [0.5] * len(cols)
+        importances = getattr(model, "feature_importances_", [0.0] * len(cols))
+        active_features = {cols[i] for i, w in enumerate(importances) if w > 1e-6}
+
     col_to_idx = {c: i for i, c in enumerate(cols)}
     base_x = [mfeats[c] for c in cols]
-
-    # Identify which features the model actually uses, so we can suppress
-    # explanation rows for feature groups that are structurally disabled
-    # (every coefficient zero, e.g. when L1 deselected the whole group).
-    coefs = model.named_steps["lr"].coef_[0]
-    active_features = {cols[i] for i, w in enumerate(coefs) if abs(w) > 1e-6}
 
     def proba(x_row):
         return float(model.predict_proba([x_row])[0][1])
