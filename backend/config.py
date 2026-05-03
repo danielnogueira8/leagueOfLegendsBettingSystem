@@ -13,8 +13,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "lol_betting.db"
 
-# How many patches back to ingest (current + N-1 prior). 3 means current + 2 prior.
-PATCH_WINDOW = 3
+# How many patches back to ingest (current + N-1 prior). 4 means current + 3 prior.
+# E.g. on patch 26.09 we ingest 26.06, 26.07, 26.08, 26.09. Wider window means
+# more training data per refresh at the cost of including slightly older meta.
+PATCH_WINDOW = 4
 
 # Leaguepedia exposes leagues via two fields:
 #   - Leagues.League_Short (e.g. "LCK")
